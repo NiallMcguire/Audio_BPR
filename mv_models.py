@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Simplified Multi-Vector Models for Brain Passage Retrieval
-Supports only CLS and Multi-Vector pooling strategies
-"""
 
 import torch
 import torch.nn as nn
