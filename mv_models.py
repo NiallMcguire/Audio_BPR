@@ -77,7 +77,7 @@ class SimplifiedBrainRetrieval(nn.Module):
                  hidden_dim=768, eeg_arch='simple', dropout=0.1,
                  use_lora=True, lora_r=16, lora_alpha=32,
                  pooling_strategy='multi', query_type='eeg',
-                 use_pretrained_text=True):
+                 use_pretrained_text=True, global_eeg_dims=None):
         super().__init__()
 
         self.query_type = query_type
@@ -132,8 +132,19 @@ class SimplifiedBrainRetrieval(nn.Module):
             encoder_dim = hidden_dim
             self.text_projection = nn.Identity()  # No additional projection needed
 
-        # EEG encoder will be created dynamically
-        self.eeg_encoder = None
+        # Initialize EEG encoder immediately if dimensions are provided
+        # FIXED: Create EEG encoder during initialization, not lazily
+        if global_eeg_dims is not None and query_type == 'eeg':
+            num_words, time_samples, channels = global_eeg_dims
+            input_size = time_samples * channels
+            # Use CPU for initialization, will be moved to correct device by .to(device) in create_model
+            self.eeg_encoder = self._create_eeg_encoder(input_size, torch.device('cpu'))
+            print(f"Initialized EEG encoder during model creation with input size {input_size}")
+        else:
+            self.eeg_encoder = None
+            if query_type == 'eeg':
+                print("Warning: global_eeg_dims not provided, EEG encoder will be created on first forward pass")
+
         self.eeg_projection = nn.Linear(hidden_dim, hidden_dim)
 
         # Components for CLS pooling
@@ -169,7 +180,7 @@ class SimplifiedBrainRetrieval(nn.Module):
                 tokenizer_vocab_size,
                 self.hidden_dim,
                 padding_idx=0
-            ).to(next(self.parameters()).device)  # ADD .to(device) HERE
+            ).to(next(self.parameters()).device)
 
     def _create_eeg_encoder(self, input_size, device):
         """Create EEG encoder based on architecture choice"""
@@ -287,8 +298,9 @@ class SimplifiedBrainRetrieval(nn.Module):
         batch_size, num_words, time_samples, channels = eeg_input.shape
         input_size = time_samples * channels
 
-        # Create EEG encoder if needed
+        # Create EEG encoder if needed (fallback for backward compatibility)
         if self.eeg_encoder is None:
+            print("Warning: Creating EEG encoder during forward pass (should have been created during init)")
             self.eeg_encoder = self._create_eeg_encoder(input_size, eeg_input.device)
 
         # Encode EEG words
@@ -460,7 +472,8 @@ class CrossEncoderBrainRetrieval(nn.Module):
     def __init__(self, colbert_model_name='colbert-ir/colbertv2.0',
                  hidden_dim=768, eeg_arch='simple', dropout=0.1,
                  use_lora=True, lora_r=16, lora_alpha=32,
-                 query_type='eeg', use_pretrained_text=True):
+                 query_type='eeg', use_pretrained_text=True,
+                 global_eeg_dims=None):
         super().__init__()
 
         self.query_type = query_type
@@ -509,8 +522,19 @@ class CrossEncoderBrainRetrieval(nn.Module):
             encoder_dim = hidden_dim
             self.text_projection = nn.Identity()  # No additional projection needed
 
-        # EEG encoder (created dynamically)
-        self.eeg_encoder = None
+        # Initialize EEG encoder immediately if dimensions are provided
+        # FIXED: Create EEG encoder during initialization, not lazily
+        if global_eeg_dims is not None and query_type == 'eeg':
+            num_words, time_samples, channels = global_eeg_dims
+            input_size = time_samples * channels
+            # Use CPU for initialization, will be moved to correct device by .to(device) in create_model
+            self.eeg_encoder = self._create_eeg_encoder(input_size, torch.device('cpu'))
+            print(f"Initialized EEG encoder during model creation with input size {input_size}")
+        else:
+            self.eeg_encoder = None
+            if query_type == 'eeg':
+                print("Warning: global_eeg_dims not provided, EEG encoder will be created on first forward pass")
+
         self.eeg_projection = nn.Linear(hidden_dim, hidden_dim)
 
         # Cross-attention layers
@@ -542,7 +566,7 @@ class CrossEncoderBrainRetrieval(nn.Module):
                 tokenizer_vocab_size,
                 self.hidden_dim,
                 padding_idx=0
-            ).to(next(self.parameters()).device)  # ADD .to(device) HERE
+            ).to(next(self.parameters()).device)
 
     def _create_eeg_encoder(self, input_size, device):
         """Create EEG encoder (same as dual encoder)"""
@@ -610,7 +634,9 @@ class CrossEncoderBrainRetrieval(nn.Module):
             num_words, time_samples, channels = eeg_queries.shape[1:]
             input_size = time_samples * channels
 
+            # Create EEG encoder if needed (fallback for backward compatibility)
             if self.eeg_encoder is None:
+                print("Warning: Creating EEG encoder during forward pass (should have been created during init)")
                 self.eeg_encoder = self._create_eeg_encoder(input_size, eeg_queries.device)
 
             if self.eeg_arch == 'transformer':
@@ -679,6 +705,7 @@ def compute_similarity(query_vectors, doc_vectors, pooling_strategy, temperature
         return compute_cls_similarity(query_vectors, doc_vectors, temperature)
     else:
         raise ValueError(f"Unknown pooling strategy: {pooling_strategy}")
+
 
 def compute_multi_vector_similarity(query_vectors, doc_vectors, temperature=1.0):
     """Compute ColBERT-style MaxSim similarity for multi-vectors"""
@@ -759,6 +786,13 @@ def create_model(colbert_model_name='colbert-ir/colbertv2.0', hidden_dim=768,
                  lora_alpha=32, pooling_strategy='multi', encoder_type='dual',
                  global_eeg_dims=None, query_type='eeg',
                  use_pretrained_text=True):
+    """
+    Create model with proper EEG encoder initialization
+
+    Args:
+        global_eeg_dims: Tuple of (num_words, time_samples, channels) for EEG input dimensions
+                         CRITICAL: Must be provided to initialize EEG encoder before optimizer
+    """
     if encoder_type == 'dual':
         model = SimplifiedBrainRetrieval(
             colbert_model_name=colbert_model_name,
@@ -769,7 +803,8 @@ def create_model(colbert_model_name='colbert-ir/colbertv2.0', hidden_dim=768,
             lora_alpha=lora_alpha,
             pooling_strategy=pooling_strategy,
             query_type=query_type,
-            use_pretrained_text=use_pretrained_text
+            use_pretrained_text=use_pretrained_text,
+            global_eeg_dims=global_eeg_dims  # FIXED: Pass global_eeg_dims
         )
     elif encoder_type == 'cross':
         model = CrossEncoderBrainRetrieval(
@@ -780,7 +815,8 @@ def create_model(colbert_model_name='colbert-ir/colbertv2.0', hidden_dim=768,
             lora_r=lora_r,
             lora_alpha=lora_alpha,
             query_type=query_type,
-            use_pretrained_text=use_pretrained_text
+            use_pretrained_text=use_pretrained_text,
+            global_eeg_dims=global_eeg_dims  # FIXED: Pass global_eeg_dims
         )
 
     return model.to(device)
