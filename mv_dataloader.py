@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""
+Simplified Dataloader for Brain Passage Retrieval with DYNAMIC RUNTIME MASKING
+Single dataloader that can change masking probability on-the-fly
+"""
 
 import numpy as np
 import torch

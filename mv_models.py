@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
+"""
+Simplified Multi-Vector Models for Brain Passage Retrieval
+Supports only CLS and Multi-Vector pooling strategies
+FIXED: Transformer with positional encodings, proper padding masks, and regularization
+"""
 
 import torch
 import torch.nn as nn
 from transformers import AutoModel
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model, TaskType
+import math
 
 
 class SimpleTextEncoder(nn.Module):
@@ -132,20 +138,28 @@ class SimplifiedBrainRetrieval(nn.Module):
             encoder_dim = hidden_dim
             self.text_projection = nn.Identity()  # No additional projection needed
 
-        # Initialize EEG encoder immediately if dimensions are provided
-        # FIXED: Create EEG encoder during initialization, not lazily
+        # FIXED: Initialize EEG encoder immediately if dimensions are provided
+        # Create EEG encoder during initialization, not lazily
         if global_eeg_dims is not None and query_type == 'eeg':
             num_words, time_samples, channels = global_eeg_dims
             input_size = time_samples * channels
-            # Use CPU for initialization, will be moved to correct device by .to(device) in create_model
-            self.eeg_encoder = self._create_eeg_encoder(input_size, torch.device('cpu'))
-            print(f"Initialized EEG encoder during model creation with input size {input_size}")
+            # FIXED: Get actual device from existing parameters
+            device = next(self.text_projection.parameters()).device if hasattr(self.text_projection,
+                                                                               'weight') else torch.device(
+                'cuda' if torch.cuda.is_available() else 'cpu')
+            self.eeg_encoder = self._create_eeg_encoder(input_size, device)
+            print(f"✓ Initialized EEG encoder during model creation with input size {input_size} on device {device}")
         else:
             self.eeg_encoder = None
             if query_type == 'eeg':
-                print("Warning: global_eeg_dims not provided, EEG encoder will be created on first forward pass")
+                print("⚠ Warning: global_eeg_dims not provided, EEG encoder will be created on first forward pass")
 
-        self.eeg_projection = nn.Linear(hidden_dim, hidden_dim)
+        # FIXED: Only apply projection for non-transformer architectures
+        # Transformer already has output projection built-in
+        if eeg_arch != 'transformer':
+            self.eeg_projection = nn.Linear(hidden_dim, hidden_dim)
+        else:
+            self.eeg_projection = nn.Identity()  # No-op for transformer
 
         # Components for CLS pooling
         if pooling_strategy == 'cls':
@@ -207,7 +221,15 @@ class SimplifiedBrainRetrieval(nn.Module):
                 nn.Linear(self.hidden_dim * 2, self.hidden_dim)
             )
         elif self.eeg_arch == 'transformer':
-            encoder = EEGTransformerEncoder(input_size, self.hidden_dim)
+            # FIXED: Pass device to transformer and use simplified architecture
+            encoder = EEGTransformerEncoder(
+                input_size=input_size,
+                hidden_dim=self.hidden_dim,
+                num_heads=4,  # SIMPLIFIED: Reduced from 8 to 4
+                num_layers=1,  # SIMPLIFIED: Keep at 1 layer
+                dropout=0.3,  # INCREASED REGULARIZATION: from 0.1 to 0.3
+                max_seq_len=50  # Set based on your max_eeg_len
+            )
         else:
             raise ValueError(f"Unknown EEG architecture: {self.eeg_arch}")
 
@@ -300,19 +322,24 @@ class SimplifiedBrainRetrieval(nn.Module):
 
         # Create EEG encoder if needed (fallback for backward compatibility)
         if self.eeg_encoder is None:
-            print("Warning: Creating EEG encoder during forward pass (should have been created during init)")
+            print("⚠ Warning: Creating EEG encoder during forward pass (should have been created during init)")
             self.eeg_encoder = self._create_eeg_encoder(input_size, eeg_input.device)
+
+        # FIXED: Compute padding mask BEFORE any processing
+        # Based on original EEG input, not projected values
+        eeg_padding_mask = (eeg_input.abs().sum(dim=(2, 3)) == 0)  # [batch, num_words]
 
         # Encode EEG words
         if self.eeg_arch == 'transformer':
             eeg_reshaped = eeg_input.view(batch_size, num_words, input_size)
-            word_representations = self.eeg_encoder(eeg_reshaped)
+            # FIXED: Pass padding mask to transformer
+            word_representations = self.eeg_encoder(eeg_reshaped, padding_mask=eeg_padding_mask)
         else:
             eeg_flat = eeg_input.view(batch_size * num_words, input_size)
             encoded = self.eeg_encoder(eeg_flat)
             word_representations = encoded.view(batch_size, num_words, self.hidden_dim)
 
-        # Project to final dimension
+        # FIXED: Only apply projection for non-transformer (transformer has built-in output projection)
         word_representations = self.eeg_projection(word_representations)
         word_representations = self.dropout(word_representations)
 
@@ -321,9 +348,8 @@ class SimplifiedBrainRetrieval(nn.Module):
             multi_vectors = []
 
             for i in range(batch_size):
-                # Find non-zero EEG word positions
-                word_mask = (eeg_input[i].abs().sum(dim=(1, 2)) > 0)
-                active_positions = torch.where(word_mask)[0]
+                # Use the pre-computed padding mask
+                active_positions = torch.where(~eeg_padding_mask[i])[0]
 
                 if len(active_positions) > 0:
                     sample_vectors = word_representations[i, active_positions]
@@ -339,9 +365,8 @@ class SimplifiedBrainRetrieval(nn.Module):
             # Max pooling over EEG word representations
             max_vectors = []
             for i in range(batch_size):
-                # Find non-zero EEG word positions
-                word_mask = (eeg_input[i].abs().sum(dim=(1, 2)) > 0)
-                active_positions = torch.where(word_mask)[0]
+                # Use the pre-computed padding mask
+                active_positions = torch.where(~eeg_padding_mask[i])[0]
 
                 if len(active_positions) > 0:
                     active_representations = word_representations[i, active_positions]  # [active_words, hidden_dim]
@@ -358,9 +383,8 @@ class SimplifiedBrainRetrieval(nn.Module):
             # Mean pooling over EEG word representations
             mean_vectors = []
             for i in range(batch_size):
-                # Find non-zero EEG word positions
-                word_mask = (eeg_input[i].abs().sum(dim=(1, 2)) > 0)
-                active_positions = torch.where(word_mask)[0]
+                # Use the pre-computed padding mask
+                active_positions = torch.where(~eeg_padding_mask[i])[0]
 
                 if len(active_positions) > 0:
                     active_representations = word_representations[i, active_positions]  # [active_words, hidden_dim]
@@ -381,14 +405,13 @@ class SimplifiedBrainRetrieval(nn.Module):
             cls_word_sequence = torch.cat([cls_tokens, word_representations], dim=1)
 
             # Create attention mask: CLS can attend to all, words attend based on EEG data
-            word_mask = (eeg_input.abs().sum(dim=(2, 3)) > 0)  # [batch, num_words]
-            cls_mask = torch.ones(batch_size, 1, device=eeg_input.device)  # CLS is never masked
-            full_mask = torch.cat([cls_mask, word_mask], dim=1)  # [batch, 1+num_words]
+            cls_mask = torch.zeros(batch_size, 1, device=eeg_input.device, dtype=torch.bool)  # CLS is never masked
+            full_mask = torch.cat([cls_mask, eeg_padding_mask], dim=1)  # [batch, 1+num_words]
 
             # Apply CLS transformer
             attended_sequence = self.eeg_cls_transformer(
                 cls_word_sequence,
-                src_key_padding_mask=~full_mask.bool()  # True = masked
+                src_key_padding_mask=full_mask  # True = masked
             )
 
             # Extract CLS token representation
@@ -423,43 +446,88 @@ class SimplifiedBrainRetrieval(nn.Module):
 
 
 class EEGTransformerEncoder(nn.Module):
-    """Transformer encoder for EEG sequences"""
+    """
+    FIXED Transformer encoder for EEG sequences with:
+    - Positional encodings (learnable)
+    - Proper padding mask handling
+    - Single output projection (no double projection)
+    - Increased regularization
+    - Simplified architecture
+    """
 
-    def __init__(self, input_size, hidden_dim=768, num_heads=8, num_layers=2):
+    def __init__(self, input_size, hidden_dim=768, num_heads=4, num_layers=1,
+                 dropout=0.3, max_seq_len=50):
         super().__init__()
 
+        self.hidden_dim = hidden_dim
+        self.max_seq_len = max_seq_len
+
+        # Input projection from flattened EEG to hidden dimension
         self.input_projection = nn.Linear(input_size, hidden_dim)
 
+        # FIXED: Add learnable positional encodings
+        self.positional_encoding = nn.Embedding(max_seq_len, hidden_dim)
+
+        # SIMPLIFIED: Reduced capacity transformer
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 2,
-            dropout=0.1,
+            nhead=num_heads,  # Reduced from 8 to 4
+            dim_feedforward=hidden_dim * 2,  # Keep at 2x
+            dropout=dropout,  # Increased from 0.1 to 0.3
             activation='relu',
-            batch_first=True
+            batch_first=True,
+            norm_first=False  # Standard: norm after residual
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
+        # FIXED: Single output projection (no double projection later)
         self.output_projection = nn.Linear(hidden_dim, hidden_dim)
 
-    def forward(self, x):
+        # Layer norm for stability
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+
+        # Additional dropout for regularization
+        self.dropout = nn.Dropout(dropout)
+
+        print(f"✓ EEGTransformerEncoder: {num_layers} layers, {num_heads} heads, dropout={dropout}")
+        print(f"  Positional encoding: learnable, max_len={max_seq_len}")
+        print(f"  Regularization: increased dropout + layer norm")
+
+    def forward(self, x, padding_mask=None):
         """
+        FIXED forward pass with positional encodings and proper masking
+
         Args:
-            x: [batch, num_words, input_size]
+            x: [batch, num_words, input_size] - Raw EEG features
+            padding_mask: [batch, num_words] - Boolean mask (True = padded position)
         Returns:
-            [batch, num_words, hidden_dim]
+            [batch, num_words, hidden_dim] - Encoded representations
         """
-        # Project input
-        x = self.input_projection(x)
+        batch_size, seq_len, _ = x.shape
 
-        # Create padding mask (True = padded position)
-        padding_mask = (x.abs().sum(dim=-1) == 0)
+        # Project input to hidden dimension
+        x = self.input_projection(x)  # [batch, seq_len, hidden_dim]
 
-        # Apply transformer
+        # FIXED: Add positional encodings
+        positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
+        pos_encodings = self.positional_encoding(positions)  # [batch, seq_len, hidden_dim]
+        x = x + pos_encodings
+
+        # Apply dropout after adding positional encodings
+        x = self.dropout(x)
+
+        # FIXED: Use the padding mask passed from encode_eeg
+        # If no mask provided, create one (backward compatibility)
+        if padding_mask is None:
+            padding_mask = (x.abs().sum(dim=-1) == 0)
+
+        # Apply transformer with proper masking
         x = self.transformer(x, src_key_padding_mask=padding_mask)
 
-        # Final projection
+        # Final projection and normalization
         x = self.output_projection(x)
+        x = self.layer_norm(x)
+        x = self.dropout(x)
 
         return x
 
@@ -522,20 +590,27 @@ class CrossEncoderBrainRetrieval(nn.Module):
             encoder_dim = hidden_dim
             self.text_projection = nn.Identity()  # No additional projection needed
 
-        # Initialize EEG encoder immediately if dimensions are provided
-        # FIXED: Create EEG encoder during initialization, not lazily
+        # FIXED: Initialize EEG encoder immediately if dimensions are provided
+        # Create EEG encoder during initialization, not lazily
         if global_eeg_dims is not None and query_type == 'eeg':
             num_words, time_samples, channels = global_eeg_dims
             input_size = time_samples * channels
-            # Use CPU for initialization, will be moved to correct device by .to(device) in create_model
-            self.eeg_encoder = self._create_eeg_encoder(input_size, torch.device('cpu'))
-            print(f"Initialized EEG encoder during model creation with input size {input_size}")
+            # FIXED: Get actual device from existing parameters
+            device = next(self.text_projection.parameters()).device if hasattr(self.text_projection,
+                                                                               'weight') else torch.device(
+                'cuda' if torch.cuda.is_available() else 'cpu')
+            self.eeg_encoder = self._create_eeg_encoder(input_size, device)
+            print(f"✓ Initialized EEG encoder during model creation with input size {input_size} on device {device}")
         else:
             self.eeg_encoder = None
             if query_type == 'eeg':
-                print("Warning: global_eeg_dims not provided, EEG encoder will be created on first forward pass")
+                print("⚠ Warning: global_eeg_dims not provided, EEG encoder will be created on first forward pass")
 
-        self.eeg_projection = nn.Linear(hidden_dim, hidden_dim)
+        # FIXED: Only apply projection for non-transformer architectures
+        if eeg_arch != 'transformer':
+            self.eeg_projection = nn.Linear(hidden_dim, hidden_dim)
+        else:
+            self.eeg_projection = nn.Identity()
 
         # Cross-attention layers
         self.cross_attention = nn.MultiheadAttention(
@@ -592,7 +667,15 @@ class CrossEncoderBrainRetrieval(nn.Module):
                 nn.Linear(self.hidden_dim * 2, self.hidden_dim)
             )
         elif self.eeg_arch == 'transformer':
-            encoder = EEGTransformerEncoder(input_size, self.hidden_dim)
+            # FIXED: Use the fixed transformer with proper settings
+            encoder = EEGTransformerEncoder(
+                input_size=input_size,
+                hidden_dim=self.hidden_dim,
+                num_heads=4,
+                num_layers=1,
+                dropout=0.3,
+                max_seq_len=50
+            )
         else:
             raise ValueError(f"Unknown EEG architecture: {self.eeg_arch}")
 
@@ -636,12 +719,16 @@ class CrossEncoderBrainRetrieval(nn.Module):
 
             # Create EEG encoder if needed (fallback for backward compatibility)
             if self.eeg_encoder is None:
-                print("Warning: Creating EEG encoder during forward pass (should have been created during init)")
+                print("⚠ Warning: Creating EEG encoder during forward pass (should have been created during init)")
                 self.eeg_encoder = self._create_eeg_encoder(input_size, eeg_queries.device)
+
+            # FIXED: Compute padding mask before processing
+            eeg_padding_mask = (eeg_queries.abs().sum(dim=(2, 3)) == 0)
 
             if self.eeg_arch == 'transformer':
                 eeg_reshaped = eeg_queries.view(batch_size, num_words, input_size)
-                query_representations = self.eeg_encoder(eeg_reshaped)
+                # FIXED: Pass padding mask to transformer
+                query_representations = self.eeg_encoder(eeg_reshaped, padding_mask=eeg_padding_mask)
             else:
                 eeg_flat = eeg_queries.view(batch_size * num_words, input_size)
                 encoded = self.eeg_encoder(eeg_flat)
@@ -649,7 +736,7 @@ class CrossEncoderBrainRetrieval(nn.Module):
 
             query_representations = self.eeg_projection(query_representations)
             query_representations = self.dropout(query_representations)
-            query_mask = (eeg_queries.abs().sum(dim=(2, 3)) > 0)  # [batch, num_words]
+            query_mask = eeg_padding_mask  # Use pre-computed mask
 
         else:  # text query
             # Text query encoding (handle both pretrained and simple)
@@ -673,19 +760,19 @@ class CrossEncoderBrainRetrieval(nn.Module):
 
             query_representations = self.text_projection(query_representations)
             query_representations = self.dropout(query_representations)
-            query_mask = text_queries['attention_mask'].bool()  # [batch, seq_len]
+            query_mask = text_queries['attention_mask'] == 0  # Convert to padding mask (True = padded)
 
         # Cross-attention: Query attends to Document
         attended_query, _ = self.cross_attention(
             query=query_representations,
             key=doc_representations,
             value=doc_representations,
-            key_padding_mask=~docs['attention_mask'].bool(),  # True = ignore
+            key_padding_mask=docs['attention_mask'] == 0,  # True = padded/ignore
             attn_mask=None
         )
 
         # Pool query representations (mean over valid positions)
-        query_mask_expanded = query_mask.unsqueeze(-1).float()  # [batch, seq_len, 1]
+        query_mask_expanded = (~query_mask).unsqueeze(-1).float()  # Invert mask: True = valid
         pooled_query = (attended_query * query_mask_expanded).sum(dim=1) / (query_mask_expanded.sum(dim=1) + 1e-8)
 
         # Get compatibility score
@@ -789,9 +876,12 @@ def create_model(colbert_model_name='colbert-ir/colbertv2.0', hidden_dim=768,
     """
     Create model with proper EEG encoder initialization
 
-    Args:
-        global_eeg_dims: Tuple of (num_words, time_samples, channels) for EEG input dimensions
-                         CRITICAL: Must be provided to initialize EEG encoder before optimizer
+    FIXES APPLIED:
+    - Positional encodings in transformer
+    - Proper padding mask computation
+    - Removed double projection
+    - Correct device initialization
+    - Increased regularization (dropout 0.3, num_heads 4, num_layers 1)
     """
     if encoder_type == 'dual':
         model = SimplifiedBrainRetrieval(
