@@ -638,69 +638,18 @@ class EnhancedAliceAudioBookReader:
 
 # Main execution with RUNTIME MASKING SUPPORT
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description='Generate ICT pairs from Alice AudioBook EEG dataset with runtime masking support',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Generate ICT pairs with default settings
-  python alice_ict_reader.py \
-    --text_path /path/to/AliceChapterOne-EEG.csv \
-    --eeg_path /path/to/Subjects \
-    --output alice_ict_pairs.npy
-
-  # Generate with custom parameters
-  python alice_ict_reader.py \
-    --text_path /path/to/AliceChapterOne-EEG.csv \
-    --eeg_path /path/to/Subjects \
-    --output alice_ict_pairs.npy \
-    --seed 42 \
-    --min_query_length 2 \
-    --max_query_length 50 \
-    --query_ratio 0.3 \
-    --pairs_per_sentence 2
-        """)
-
-    # Required arguments
-    parser.add_argument('--text_path', type=str, required=True,
-                        help='Path to AliceChapterOne-EEG.csv file')
-    parser.add_argument('--eeg_path', type=str, required=True,
-                        help='Path to Subjects directory containing EEG data')
-    parser.add_argument('--output', type=str, required=True,
-                        help='Output filename for ICT pairs (.npy file)')
-
-    # Common ICT generation parameters
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed for reproducibility (default: 42)')
-    parser.add_argument('--min_query_length', type=int, default=2,
-                        help='Minimum query length in words (default: 2)')
-    parser.add_argument('--max_query_length', type=int, default=50,
-                        help='Maximum query length in words (default: 50)')
-    parser.add_argument('--query_ratio', type=float, default=0.3,
-                        help='Query length as fraction of sentence (default: 0.3)')
-    parser.add_argument('--min_sentence_length', type=int, default=6,
-                        help='Minimum sentence length to process (default: 6)')
-    parser.add_argument('--pairs_per_sentence', type=int, default=2,
-                        help='ICT pairs generated per sentence (default: 2)')
-    parser.add_argument('--max_pairs', type=int, default=None,
-                        help='Maximum total pairs to generate (default: unlimited)')
-
-    # Alice-specific parameters
-    parser.add_argument('--limit_subjects', type=int, default=None,
-                        help='Limit number of subjects to process (default: all)')
-    parser.add_argument('--target_freq', type=int, default=128,
-                        help='Target sampling frequency in Hz (default: 128)')
-    parser.add_argument('--target_channels', type=int, default=128,
-                        help='Target number of EEG channels (default: 128)')
-    parser.add_argument('--no_preprocess', action='store_true',
-                        help='Disable EEG preprocessing')
-
-    args = parser.parse_args()
-
-    print("🚀 ALICE AUDIOBOOK ICT PAIR GENERATION - RUNTIME MASKING SUPPORT")
+    print("🚀 ENHANCED ALICE AUDIOBOOK ICT PAIR GENERATION - RUNTIME MASKING SUPPORT")
     print("=" * 80)
+
+    # Configuration - RUNTIME MASKING READY
+    RANDOM_SEED = 42
+    LIMIT_SUBJECTS = None  # None = ALL subjects
+    MAX_ICT_PAIRS = None  # None = ALL possible ICT pairs
+
+    # File paths
+    text_path = "/users/gxb18167/SIGIR-Resource-Paper/Audio-Book-Alice/AliceChapterOne-EEG.csv"
+    eeg_base_path = "/users/gxb18167/SIGIR-Resource-Paper/Audio-Book-Alice/Subjects"
+    output_file = "alice_ict_pairs_RUNTIME_MASKING.npy"
 
     print(f"📧 RUNTIME MASKING FEATURES:")
     print(f"   ✅ No masking applied at generation time")
@@ -710,19 +659,19 @@ Examples:
 
     # Initialize the enhanced reader
     reader = EnhancedAliceAudioBookReader(
-        text_path=args.text_path,
-        eeg_base_path=args.eeg_path,
-        preprocess=not args.no_preprocess,
-        target_freq=args.target_freq,
-        target_channels=args.target_channels,
+        text_path=text_path,
+        eeg_base_path=eeg_base_path,
+        preprocess=True,
+        target_freq=128,
+        target_channels=128,
         Downsample=True,
         Padding=True,
         Bandpass=True,
         AverageRef=True,
         low_freq=0.5,
         high_freq=100,
-        random_seed=args.seed,
-        limit_subjects=args.limit_subjects,
+        random_seed=RANDOM_SEED,
+        limit_subjects=LIMIT_SUBJECTS,
         verbose=True
     )
 
@@ -737,20 +686,20 @@ Examples:
     # Step 2: Generate ICT pairs with RUNTIME MASKING SUPPORT
     print(f"\n📧 Step 2: Generating ICT pairs with runtime masking support...")
     ict_pairs = reader.generate_ict_pairs(
-        min_query_length=args.min_query_length,
-        max_query_length=args.max_query_length,
-        query_length_ratio=args.query_ratio,
-        min_sentence_length=args.min_sentence_length,
+        min_query_length=2,
+        max_query_length=50,
+        query_length_ratio=0.30,
+        min_sentence_length=6,
         use_ratio_based_queries=True,
-        max_pairs_per_sentence=args.pairs_per_sentence,
-        max_total_pairs=args.max_pairs,
-        random_seed=args.seed
+        max_pairs_per_sentence=2,
+        max_total_pairs=MAX_ICT_PAIRS,
+        random_seed=RANDOM_SEED
     )
 
     # Step 3: Save with metadata
     if ict_pairs:
         print(f"\n💾 Step 3: Saving ICT pairs with runtime masking support...")
-        reader.save_ict_pairs_with_metadata(ict_pairs, args.output)
+        reader.save_ict_pairs_with_metadata(ict_pairs, output_file)
 
         # Final statistics - RUNTIME MASKING FORMAT
         print(f"\n📊 FINAL RESULTS:")
@@ -762,12 +711,12 @@ Examples:
         print(f"📝 Unique sentences: {len(sentences_used)}")
         print(f"🎭 All pairs UNMASKED (ready for runtime masking)")
         print(f"🧠 Total ICT pairs: {len(ict_pairs)}")
-        print(f"✅ Saved to: {args.output}")
+        print(f"✅ Saved to: {output_file}")
 
         print(f"\n🎉 SUCCESS - RUNTIME MASKING SUPPORT COMPLETE!")
         print(f"✅ Generated {len(ict_pairs)} ICT pairs ready for runtime masking")
         print(f"✅ Compatible with masking levels: 0%, 25%, 50%, 75%, 90%, 100%")
-        print(f"✅ Full reproducibility with seed: {args.seed}")
+        print(f"✅ Full reproducibility with seed: {RANDOM_SEED}")
         print(f"🚀 Ready for multi-masking validation during training!")
 
     else:

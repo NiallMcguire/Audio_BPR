@@ -710,74 +710,29 @@ class CorrectedCompleteWordEEGAligner:
         print(f"🎭 Ready for multi-masking validation (0%, 25%, 50%, 75%, 90%, 100%)")
 
 
+# Main execution with RUNTIME MASKING SUPPORT
 if __name__ == "__main__":
-    import argparse
+    print("🚀 CORRECTED NIEUWLAND ICT PAIR GENERATION - RUNTIME MASKING SUPPORT")
+    print("=" * 60)
 
-    parser = argparse.ArgumentParser(
-        description='Generate ICT pairs from Nieuwland EEG dataset with runtime masking support',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Generate ICT pairs with default settings
-  python nieuwland_ict_reader.py \
-    --data_dir /path/to/Processed_segmented_data \
-    --sentence_dir /path/to/Sentence_Materials \
-    --output nieuwland_ict_pairs.npy
+    # Configuration - RUNTIME MASKING READY
+    RANDOM_SEED = 42
+    LIMIT_PARTICIPANTS = None  # Use all available participants
+    MAX_SENTENCES_PER_PARTICIPANT = None  # Use all sentences
+    MAX_ICT_PAIRS = None  # Generate all possible ICT pairs
 
-  # Generate with custom parameters
-  python nieuwland_ict_reader.py \
-    --data_dir /path/to/Processed_segmented_data \
-    --sentence_dir /path/to/Sentence_Materials \
-    --output nieuwland_ict_pairs.npy \
-    --seed 42 \
-    --min_query_length 2 \
-    --max_query_length 50 \
-    --query_ratio 0.3 \
-    --pairs_per_sentence 2
-        """)
+    # File paths
+    data_dir = "/users/gxb18167/Processed segmented data"
+    sentence_materials_dir = "/users/gxb18167/Sentence Materials"
+    output_file = "nieuwland_ict_pairs_RUNTIME_MASKING.npy"
 
-    # Required arguments
-    parser.add_argument('--data_dir', type=str, required=True,
-                        help='Path to Processed_segmented_data directory')
-    parser.add_argument('--sentence_dir', type=str, required=True,
-                        help='Path to Sentence_Materials directory')
-    parser.add_argument('--output', type=str, required=True,
-                        help='Output filename for ICT pairs (.npy file)')
-
-    # Common ICT generation parameters
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed for reproducibility (default: 42)')
-    parser.add_argument('--min_query_length', type=int, default=2,
-                        help='Minimum query length in words (default: 2)')
-    parser.add_argument('--max_query_length', type=int, default=50,
-                        help='Maximum query length in words (default: 50)')
-    parser.add_argument('--query_ratio', type=float, default=0.3,
-                        help='Query length as fraction of sentence (default: 0.3)')
-    parser.add_argument('--min_sentence_length', type=int, default=6,
-                        help='Minimum sentence length to process (default: 6)')
-    parser.add_argument('--pairs_per_sentence', type=int, default=2,
-                        help='ICT pairs generated per sentence (default: 2)')
-    parser.add_argument('--max_pairs', type=int, default=None,
-                        help='Maximum total pairs to generate (default: unlimited)')
-
-    # Nieuwland-specific parameters
-    parser.add_argument('--limit_participants', type=int, default=None,
-                        help='Limit number of participants to process (default: all)')
-    parser.add_argument('--max_sentences_per_participant', type=int, default=None,
-                        help='Maximum sentences per participant (default: all)')
-
-    args = parser.parse_args()
-
-    print("🚀 NIEUWLAND ICT PAIR GENERATION - RUNTIME MASKING SUPPORT")
-    print("=" * 80)
-
-    print(f"📊 EXPECTED OUTPUT (based on typical runs):")
+    print(f"📊 EXPECTED OUTPUT (based on your previous run):")
     print(f"   👥 Participants: ~51")
     print(f"   📝 Sentences: ~4,067")
     print(f"   🧠 Words: ~91,383")
     print(f"   🎯 ICT pairs: ~8,000-10,000")
 
-    print(f"\n📧 RUNTIME MASKING FEATURES:")
+    print(f"📧 RUNTIME MASKING FEATURES:")
     print(f"   ✅ No masking applied at generation time")
     print(f"   ✅ Stores query span metadata for runtime masking")
     print(f"   ✅ Compatible with any masking probability (0%-100%)")
@@ -785,33 +740,33 @@ Examples:
 
     # Initialize the corrected aligner
     aligner = CorrectedCompleteWordEEGAligner(
-        data_dir=args.data_dir,
-        sentence_materials_dir=args.sentence_dir,
-        random_seed=args.seed,
-        limit_participants=args.limit_participants
+        data_dir=data_dir,
+        sentence_materials_dir=sentence_materials_dir,
+        random_seed=RANDOM_SEED,
+        limit_participants=LIMIT_PARTICIPANTS
     )
 
     # Step 1: Align words to EEG
     print(f"\n📬 Step 1: Aligning words to EEG...")
-    aligner.align_all_words_to_eeg(max_sentences_per_participant=args.max_sentences_per_participant)
+    aligner.align_all_words_to_eeg(max_sentences_per_participant=MAX_SENTENCES_PER_PARTICIPANT)
 
     # Step 2: Generate ICT pairs with RUNTIME MASKING SUPPORT
     print(f"\n📧 Step 2: Generating ICT pairs with runtime masking support...")
     ict_pairs = aligner.generate_ict_pairs(
-        min_query_length=args.min_query_length,
-        max_query_length=args.max_query_length,
-        query_length_ratio=args.query_ratio,
-        min_sentence_length=args.min_sentence_length,
+        min_query_length=2,
+        max_query_length=50,
+        query_length_ratio=0.30,
+        min_sentence_length=6,
         use_ratio_based_queries=True,
-        max_pairs_per_sentence=args.pairs_per_sentence,
-        max_total_pairs=args.max_pairs,
-        random_seed=args.seed
+        max_pairs_per_sentence=2,  # 2 pairs per sentence
+        max_total_pairs=MAX_ICT_PAIRS,
+        random_seed=RANDOM_SEED
     )
 
     # Step 3: Save with metadata
     if ict_pairs:
         print(f"\n💾 Step 3: Saving ICT pairs with runtime masking support...")
-        aligner.save_ict_pairs_with_metadata(ict_pairs, args.output)
+        aligner.save_ict_pairs_with_metadata(ict_pairs, output_file)
 
         # Final statistics - RUNTIME MASKING FORMAT
         print(f"\n📊 FINAL RESULTS:")
@@ -823,12 +778,12 @@ Examples:
         print(f"📝 Unique sentences: {len(sentences)}")
         print(f"🎭 All pairs UNMASKED (ready for runtime masking)")
         print(f"🧠 Total ICT pairs: {len(ict_pairs)}")
-        print(f"✅ Saved to: {args.output}")
+        print(f"✅ Saved to: {output_file}")
 
         print(f"\n🎉 SUCCESS - RUNTIME MASKING SUPPORT COMPLETE!")
         print(f"✅ Generated {len(ict_pairs)} ICT pairs ready for runtime masking")
         print(f"✅ Compatible with masking levels: 0%, 25%, 50%, 75%, 90%, 100%")
-        print(f"✅ Full reproducibility with seed: {args.seed}")
+        print(f"✅ Full reproducibility with seed: {RANDOM_SEED}")
         print(f"🚀 Ready for multi-masking validation during training!")
 
     else:
