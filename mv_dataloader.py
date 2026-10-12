@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 import random
+import hashlib
 from typing import Dict, List, Optional, Tuple
 import warnings
 
@@ -51,6 +52,20 @@ def detect_dataset_format(data_path):
             return 'original'
     except:
         return 'original'
+
+
+def infer_dataset_source(data_path, metadata=None):
+    """Return a stable source label shared by single and combined loading."""
+    metadata = metadata or {}
+    hints = ' '.join((Path(data_path).stem if data_path else '',
+                      str(metadata.get('dataset_name', '')), str(metadata.get('version', '')))).lower()
+    if 'nieuwland' in hints or 'visual' in hints:
+        return 'nieuwland'
+    if 'alice' in hints or 'audio' in hints:
+        return 'alice'
+    if 'authentic' in hints or 'task' in hints or 'reading' in hints:
+        return 'authentic_query'
+    return Path(data_path).stem.lower() if data_path else 'unknown'
 
 
 def convert_nieuwland_to_original_format(ict_pairs):
@@ -144,6 +159,8 @@ def load_combined_datasets(data_paths, dataset_types=None):
         ict_pairs = dataset['ict_pairs']
         metadata = dataset.get('metadata', {})
 
+        dataset_name = infer_dataset_source(data_path, metadata)
+
         # Convert if needed
         if detected_format == 'nieuwland':
             print(f"  Converting {len(ict_pairs)} Nieuwland pairs...")
@@ -151,13 +168,16 @@ def load_combined_datasets(data_paths, dataset_types=None):
 
         # Add source information
         for pair in ict_pairs:
-            pair['dataset_source'] = f"dataset_{i + 1}_{detected_format}"
+            pair['dataset_source'] = dataset_name
+            pair['supports_runtime_masking'] = bool(
+                pair.get('supports_runtime_masking', metadata.get('supports_runtime_masking', False))
+            )
 
         all_ict_pairs.extend(ict_pairs)
         print(f"  Added {len(ict_pairs)} pairs (total: {len(all_ict_pairs)})")
 
         # Store metadata
-        combined_metadata[f'dataset_{i + 1}'] = {
+        combined_metadata[dataset_name] = {
             'path': str(data_path), 'format': detected_format, 'count': len(ict_pairs),
             'original_metadata': metadata
         }
@@ -236,7 +256,7 @@ class DynamicMaskingDataloader(Dataset):
                  holdout_subjects: bool = False,
                  initial_masking_probability: float = 0.9,
                  combined_dataset: dict = None,
-                 fold: int = None):  # NEW PARAMETER
+                 fold: int = None, pair_split_seed: int = 42):
 
         self.tokenizer = tokenizer
         self.max_text_len = max_text_len
@@ -246,6 +266,7 @@ class DynamicMaskingDataloader(Dataset):
         self.num_vectors = num_vectors
         self.holdout_subjects = holdout_subjects
         self.fold = fold  # NEW: Store fold number
+        self.pair_split_seed = pair_split_seed
 
         # DYNAMIC: Store masking probability as mutable attribute
         self._current_masking_probability = initial_masking_probability
@@ -285,6 +306,13 @@ class DynamicMaskingDataloader(Dataset):
                     print(f"Converting Nieuwland format to original format")
                 self.ict_pairs = convert_nieuwland_to_original_format(self.ict_pairs)
 
+        # Normalize source and masking metadata so single-source and mixed-source
+        # runs make the same per-source split and preserve task answers unmasked.
+        inferred_source = infer_dataset_source(data_path, self.metadata)
+        for pair in self.ict_pairs:
+            pair.setdefault('dataset_source', inferred_source)
+            pair.setdefault('supports_runtime_masking', bool(self.metadata.get('supports_runtime_masking', False)))
+
         # Check if dataset supports runtime masking
         self.supports_runtime_masking = self.metadata.get('supports_runtime_masking', False)
 
@@ -296,8 +324,6 @@ class DynamicMaskingDataloader(Dataset):
                 print(f"5-fold CV mode: Using fold {fold}")
 
         # Create train/val/test split
-        random.seed(42)  # Fixed seed for reproducible splits
-
         if holdout_subjects:
             # Subject-based split (with optional 5-fold CV)
             if self.debug:
@@ -307,38 +333,11 @@ class DynamicMaskingDataloader(Dataset):
                     print("Using holdout subjects split (80% train, 10% val, 10% test)")
             self.indices, self.unique_subjects = self._create_subject_split(split, train_ratio, debug, fold)
         else:
-            # Random sample split with train/val/test support
+            # Deterministic pair-level split within each source. This preserves
+            # the same source test pairs when other datasets are added/removed.
             if self.debug:
-                print("Using random sample split")
-            shuffled_indices = list(range(len(self.ict_pairs)))
-            random.shuffle(shuffled_indices)
-
-            # Support both 2-way and 3-way splits
-            if split in ['train', 'val']:
-                # Standard 2-way split during training
-                split_idx = int(len(self.ict_pairs) * train_ratio)
-                if split == 'train':
-                    self.indices = shuffled_indices[:split_idx]
-                elif split == 'val':
-                    self.indices = shuffled_indices[split_idx:]
-            elif split == 'test':
-                # 3-way split: use validation portion and split it further
-                val_start_idx = int(len(self.ict_pairs) * train_ratio)
-                val_indices = shuffled_indices[val_start_idx:]
-
-                # Split remaining data: 50% val, 50% test
-                val_split_point = len(val_indices) // 2
-                if split == 'test':
-                    self.indices = val_indices[val_split_point:]  # Second half for test
-                # Note: 'val' case handled above
-            else:
-                raise ValueError(f"Split must be 'train', 'val', or 'test', got {split}")
-
-            # For random split, count unique subjects in this split
-            self.unique_subjects = set()
-            for idx in self.indices:
-                participant_id = self.ict_pairs[idx].get('participant_id', 'unknown')
-                self.unique_subjects.add(participant_id)
+                print("Using deterministic pair-level split per source (80/10/10 by default)")
+            self.indices, self.unique_subjects = self._create_pair_split(split, train_ratio, pair_split_seed)
 
         self.pairs = [self.ict_pairs[i] for i in self.indices]
 
@@ -364,6 +363,35 @@ class DynamicMaskingDataloader(Dataset):
 
         old_probability = self._current_masking_probability
         self._current_masking_probability = new_probability
+
+    def _create_pair_split(self, split, train_ratio, seed):
+        if split not in {'train', 'val', 'test'}:
+            raise ValueError(f"Split must be 'train', 'val', or 'test', got {split}")
+        if not 0.0 < train_ratio < 1.0:
+            raise ValueError(f"train_ratio must be between 0 and 1, got {train_ratio}")
+
+        by_source = {}
+        for index, pair in enumerate(self.ict_pairs):
+            by_source.setdefault(pair.get('dataset_source', 'unknown'), []).append(index)
+
+        selected = []
+        for source in sorted(by_source):
+            indices = by_source[source][:]
+            digest = hashlib.sha256(f"{seed}:{source}".encode('utf-8')).digest()
+            source_seed = int.from_bytes(digest[:8], byteorder='big')
+            random.Random(source_seed).shuffle(indices)
+            train_end = int(len(indices) * train_ratio)
+            val_size = int(len(indices) * (1.0 - train_ratio) / 2.0)
+            val_end = min(train_end + val_size, len(indices))
+            if split == 'train':
+                selected.extend(indices[:train_end])
+            elif split == 'val':
+                selected.extend(indices[train_end:val_end])
+            else:
+                selected.extend(indices[val_end:])
+
+        participants = {self.ict_pairs[index].get('participant_id', 'unknown') for index in selected}
+        return selected, participants
 
         if self.debug:
             print(f"Changed masking probability: {old_probability:.2f} -> {new_probability:.2f}")
@@ -517,13 +545,15 @@ class DynamicMaskingDataloader(Dataset):
         if not query_text or not original_doc_text:
             return None
 
-        # Store RAW masking information (don't apply masking yet)
+        # Preserve per-source masking behavior in combined experiments.
+        pair_has_masking_flag = 'supports_runtime_masking' in pair
+        pair_supports_masking = bool(pair.get('supports_runtime_masking', self.supports_runtime_masking))
         query_start_idx = pair.get('query_start_idx', 0)
         query_end_idx = pair.get('query_end_idx', 0)
         full_sentence_words = pair.get('full_sentence_words', original_doc_text.split())
 
-        # For datasets without runtime masking support, try to extract from existing data
-        if not self.supports_runtime_masking:
+        # Legacy files may need a text-span lookup; explicit non-ICT task pairs must stay whole.
+        if not pair_supports_masking and not pair_has_masking_flag:
             # Fallback: try to reconstruct query span info from query and doc text
             query_words = query_text.split()
             doc_words = original_doc_text.split()
@@ -540,6 +570,10 @@ class DynamicMaskingDataloader(Dataset):
                     break
 
             full_sentence_words = doc_words
+        elif not pair_supports_masking:
+            query_start_idx = 0
+            query_end_idx = 0
+            full_sentence_words = original_doc_text.split()
 
         # Extract EEG data
         query_eeg = pair.get('query_eeg', None)
@@ -565,11 +599,21 @@ class DynamicMaskingDataloader(Dataset):
             'query_start_idx': query_start_idx,
             'query_end_idx': query_end_idx,
             'full_sentence_words': full_sentence_words,
-            'supports_runtime_masking': self.supports_runtime_masking
+            'supports_runtime_masking': pair_supports_masking,
+            'question_id': pair.get('question_id', ''),
+            'session_id': pair.get('session_id', ''),
+            'part': pair.get('part', ''),
+            'trial': pair.get('trial', ''),
+            'answer_status': pair.get('answer_status', ''),
+            'alignment_status': pair.get('alignment_status', ''),
+            'source_identity_group': pair.get('source_identity_group', '')
         }
 
     def _apply_dynamic_masking(self, processed_pair, idx):
         """Apply masking dynamically based on current masking probability"""
+        if not processed_pair.get('supports_runtime_masking', self.supports_runtime_masking):
+            return processed_pair['original_doc_text'], processed_pair['full_sentence_words'], False
+
         if self._current_masking_probability <= 0:
             # No masking - return original document
             return processed_pair['original_doc_text'], processed_pair['full_sentence_words'], False
@@ -757,6 +801,13 @@ class DynamicMaskingDataloader(Dataset):
                 'was_masked': was_masked,  # NEW: Runtime masking result
                 'current_masking_probability': self._current_masking_probability,  # NEW
                 'dataset_source': sample['dataset_source'],
+                'question_id': sample.get('question_id', ''),
+                'session_id': sample.get('session_id', ''),
+                'part': sample.get('part', ''),
+                'trial': sample.get('trial', ''),
+                'answer_status': sample.get('answer_status', ''),
+                'alignment_status': sample.get('alignment_status', ''),
+                'source_identity_group': sample.get('source_identity_group', ''),
                 'original_idx': sample['original_idx'],
                 'query_text': sample['query_text'],
                 'document_text': doc_text,  # Dynamically masked

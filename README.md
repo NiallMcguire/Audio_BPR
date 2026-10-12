@@ -387,3 +387,36 @@ Training produces:
 
 Please cite the original dataset papers when using these resources.
 
+## Authentic Query Mixed Experiments
+
+The extracted task data can be converted into EEG-question-to-answer pairs. Query EEG is built from fixation epochs whose word index is confidently matched to the displayed `question_text`; the target passage is `ground_truth_response`. These task pairs are marked as non-ICT, so their complete answer text is never runtime-masked.
+
+```bash
+python Dataset/authentic_query_reader.py \
+  --dataset-dir ../dataset \
+  --output ../dataset/authentic_query_task_pairs.npy \
+  --unaligned-clock-offset-seconds 0
+```
+
+P001 and P002 are included using the supplied offset as an **unverified assumption** because their PsychoPy clock is not synchronized to EEG. Their byte-identical source files also do not establish independent participant identity. The generated manifest records this, as well as trials skipped for missing answer rows or question-word EEG.
+
+Prepare seven Slurm job files for the comparison matrix:
+
+1. Task only
+2. Audio only
+3. Visual only
+4. Audio + visual
+5. Audio + task
+6. Visual + task
+7. Audio + visual + task
+
+```bash
+python experiment_scheduler.py \
+  --audio-data /path/to/alice_ict_pairs.npy \
+  --visual-data /path/to/nieuwland_ict_pairs.npy \
+  --task-data ../dataset/authentic_query_task_pairs.npy \
+  --output-dir prepared_experiments
+```
+
+This command only writes the experiment matrix and `.sbatch` files; it does not submit jobs. Pair-level train/validation/test assignments are deterministic and stratified per source, and the same source test pairs are reused across mixtures. Mixed-source training samples sources with equal probability. Test evaluation ranks each source's queries against only that source's held-out candidate passages; per-source metrics are written under each run's `test_by_source/` directory. The task source remains unmasked at every masking level, while Audio and Visual ICT passages use the configured span masking.
+

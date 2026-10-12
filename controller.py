@@ -10,13 +10,14 @@ import numpy as np
 import random
 import argparse
 from pathlib import Path
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from transformers import AutoTokenizer
 import json
 from datetime import datetime
 
 # Import custom modules
-from mv_dataloader import DynamicMaskingDataloader, simple_collate_fn, compute_global_eeg_dimensions
+from mv_dataloader import (DynamicMaskingDataloader, simple_collate_fn,
+                           compute_combined_eeg_dimensions, load_combined_datasets)
 from mv_models import create_model
 from mv_training import train_model, test_model, finish_wandb
 
@@ -62,68 +63,63 @@ def handle_multiple_datasets(data_paths, max_eeg_len):
 
 def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_len,
                        train_ratio, holdout_subjects, training_masking_level,
-                       global_eeg_dims=None, combined_dataset=None):
+                       global_eeg_dims=None, combined_dataset=None,
+                       pair_split_seed=42, balance_sources=False):
     """Create training, validation, and test dataloaders"""
 
-    # Compute global EEG dimensions if not provided
-    if global_eeg_dims is None and data_path:
-        global_eeg_dims = compute_global_eeg_dimensions(data_path, max_eeg_len, 'auto')
-        print(f"Computed global EEG dimensions: {global_eeg_dims[0]}x{global_eeg_dims[1]}x{global_eeg_dims[2]}")
+    # Load each source once. Reopening a very large .npy three times for train,
+    # validation, and test retains multiple full copies and can OOM host RAM.
+    if combined_dataset is None:
+        if data_path is None:
+            raise ValueError("data_path or combined_dataset must be provided")
+        all_pairs, source_metadata = load_combined_datasets([data_path], ['auto'])
+        combined_dataset = {'ict_pairs': all_pairs, 'metadata': source_metadata}
+        data_path = None
+        if global_eeg_dims is None:
+            global_eeg_dims = compute_combined_eeg_dimensions(all_pairs, max_eeg_len)
+    elif global_eeg_dims is None:
+        global_eeg_dims = compute_combined_eeg_dimensions(combined_dataset['ict_pairs'], max_eeg_len)
+    print(f"Computed shared EEG dimensions: {global_eeg_dims[0]}x{global_eeg_dims[1]}x{global_eeg_dims[2]}")
 
     training_masking_prob = training_masking_level / 100.0
 
     # Create datasets
-    if combined_dataset is None:
-        # Single dataset
-        train_dataset = DynamicMaskingDataloader(
-            data_path=data_path, tokenizer=tokenizer, max_text_len=max_text_len,
-            max_eeg_len=max_eeg_len, split='train', train_ratio=train_ratio,
-            global_eeg_dims=global_eeg_dims, dataset_type='auto',
-            holdout_subjects=holdout_subjects, initial_masking_probability=training_masking_prob
-        )
+    train_dataset = DynamicMaskingDataloader(
+        data_path=None, combined_dataset=combined_dataset, tokenizer=tokenizer,
+        max_text_len=max_text_len, max_eeg_len=max_eeg_len, split='train',
+        train_ratio=train_ratio, global_eeg_dims=global_eeg_dims,
+        dataset_type='original', holdout_subjects=holdout_subjects,
+        initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed
+    )
 
-        val_dataset = DynamicMaskingDataloader(
-            data_path=data_path, tokenizer=tokenizer, max_text_len=max_text_len,
-            max_eeg_len=max_eeg_len, split='val', train_ratio=train_ratio,
-            global_eeg_dims=global_eeg_dims, dataset_type='auto',
-            holdout_subjects=holdout_subjects, initial_masking_probability=training_masking_prob
-        )
+    val_dataset = DynamicMaskingDataloader(
+        data_path=None, combined_dataset=combined_dataset, tokenizer=tokenizer,
+        max_text_len=max_text_len, max_eeg_len=max_eeg_len, split='val',
+        train_ratio=train_ratio, global_eeg_dims=global_eeg_dims,
+        dataset_type='original', holdout_subjects=holdout_subjects,
+        initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed
+    )
 
-        test_dataset = DynamicMaskingDataloader(
-            data_path=data_path, tokenizer=tokenizer, max_text_len=max_text_len,
-            max_eeg_len=max_eeg_len, split='test', train_ratio=train_ratio,
-            global_eeg_dims=global_eeg_dims, dataset_type='auto',
-            holdout_subjects=holdout_subjects, initial_masking_probability=training_masking_prob
-        )
-    else:
-        # Combined datasets
-        train_dataset = DynamicMaskingDataloader(
-            data_path=None, combined_dataset=combined_dataset, tokenizer=tokenizer,
-            max_text_len=max_text_len, max_eeg_len=max_eeg_len, split='train',
-            train_ratio=train_ratio, global_eeg_dims=global_eeg_dims,
-            dataset_type='original', holdout_subjects=holdout_subjects,
-            initial_masking_probability=training_masking_prob
-        )
+    test_dataset = DynamicMaskingDataloader(
+        data_path=None, combined_dataset=combined_dataset, tokenizer=tokenizer,
+        max_text_len=max_text_len, max_eeg_len=max_eeg_len, split='test',
+        train_ratio=train_ratio, global_eeg_dims=global_eeg_dims,
+        dataset_type='original', holdout_subjects=holdout_subjects,
+        initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed
+    )
 
-        val_dataset = DynamicMaskingDataloader(
-            data_path=None, combined_dataset=combined_dataset, tokenizer=tokenizer,
-            max_text_len=max_text_len, max_eeg_len=max_eeg_len, split='val',
-            train_ratio=train_ratio, global_eeg_dims=global_eeg_dims,
-            dataset_type='original', holdout_subjects=holdout_subjects,
-            initial_masking_probability=training_masking_prob
-        )
-
-        test_dataset = DynamicMaskingDataloader(
-            data_path=None, combined_dataset=combined_dataset, tokenizer=tokenizer,
-            max_text_len=max_text_len, max_eeg_len=max_eeg_len, split='test',
-            train_ratio=train_ratio, global_eeg_dims=global_eeg_dims,
-            dataset_type='original', holdout_subjects=holdout_subjects,
-            initial_masking_probability=training_masking_prob
-        )
+    train_sampler = None
+    train_sources = [pair.get('dataset_source', 'unknown') for pair in train_dataset.processed_pairs]
+    source_counts = {source: train_sources.count(source) for source in set(train_sources)}
+    if balance_sources and len(source_counts) > 1:
+        weights = torch.tensor([1.0 / source_counts[source] for source in train_sources], dtype=torch.double)
+        generator = torch.Generator().manual_seed(pair_split_seed)
+        train_sampler = WeightedRandomSampler(weights, num_samples=len(train_sources), replacement=True,
+                                              generator=generator)
 
     # Create dataloaders
     train_dataloader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
+        train_dataset, batch_size=batch_size, shuffle=train_sampler is None, sampler=train_sampler,
         collate_fn=simple_collate_fn, num_workers=0
     )
 
@@ -143,6 +139,43 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
     print(f"  Test: {len(test_dataset)} samples from {len(test_dataset.unique_subjects)} subjects")
 
     return train_dataloader, val_dataloader, test_dataloader, global_eeg_dims
+
+
+class MaskingAwareSubset(Subset):
+    """Subset view that forwards the dynamic masking controls used by test_model."""
+
+    @property
+    def unique_subjects(self):
+        base = self.dataset
+        return {base.processed_pairs[index].get('participant_id', 'unknown') for index in self.indices}
+
+    def get_current_masking_probability(self):
+        return self.dataset.get_current_masking_probability()
+
+    def set_masking_probability(self, probability):
+        self.dataset.set_masking_probability(probability)
+
+
+def create_source_test_loaders(test_dataloader):
+    """Return test loaders with a separate candidate pool for each source."""
+    dataset = test_dataloader.dataset
+    local_indices_by_source = {}
+    for local_index, pair in enumerate(dataset.processed_pairs):
+        source = pair.get('dataset_source', 'unknown')
+        local_indices_by_source.setdefault(source, []).append(local_index)
+    return {
+        source: DataLoader(
+            MaskingAwareSubset(dataset, local_indices), batch_size=test_dataloader.batch_size,
+            shuffle=False, collate_fn=simple_collate_fn, num_workers=0
+        )
+        for source, local_indices in sorted(local_indices_by_source.items())
+        if local_indices
+    }
+
+
+def save_test_metrics(path, results):
+    """Write source-specific test metrics in JSON-friendly form."""
+    path.write_text(json.dumps(results, indent=2, default=float) + '\n', encoding='utf-8')
 
 
 def main():
@@ -173,6 +206,8 @@ def main():
     # Data split arguments
     parser.add_argument('--holdout_subjects', action='store_true',
                         help='Use subject-based train/val/test split')
+    parser.add_argument('--balance_sources', action='store_true',
+                        help='Sample mixed-source training pairs with equal source probability')
 
     # Masking arguments
     parser.add_argument('--training_masking_level', type=int, default=90,
@@ -280,7 +315,9 @@ def main():
         holdout_subjects=args.holdout_subjects,
         training_masking_level=args.training_masking_level,
         global_eeg_dims=global_eeg_dims,
-        combined_dataset=combined_dataset
+        combined_dataset=combined_dataset,
+        pair_split_seed=args.seed,
+        balance_sources=args.balance_sources
     )
 
     # Create experiment configuration
@@ -296,6 +333,9 @@ def main():
         'epochs': args.epochs,
         'patience': args.patience,
         'holdout_subjects': args.holdout_subjects,
+        'pair_level_split': not args.holdout_subjects,
+        'pair_split_seed': args.seed,
+        'balance_sources': args.balance_sources,
         'training_masking_level': args.training_masking_level,
         'enable_multi_masking_validation': args.enable_multi_masking_validation,
         'validation_masking_levels': args.validation_masking_levels,
@@ -377,15 +417,21 @@ def main():
 
     # Test evaluation
     if len(test_dataloader.dataset) > 0:
-        print(f"\n=== TEST EVALUATION ===")
-        test_results = test_model(
-            model=trained_model,
-            test_dataloader=test_dataloader,
-            device=device,
-            test_masking_levels=args.validation_masking_levels,
-            primary_masking_level=args.primary_masking_level
-        )
-        print("Test evaluation completed")
+        print(f"\n=== SOURCE-SPECIFIC TEST EVALUATION ===")
+        results_dir = output_dir / 'test_by_source'
+        results_dir.mkdir(exist_ok=True)
+        for source, source_loader in create_source_test_loaders(test_dataloader).items():
+            print(f"Testing {source} queries against the {source} candidate pool")
+            test_results = test_model(
+                model=trained_model,
+                test_dataloader=source_loader,
+                device=device,
+                test_masking_levels=args.validation_masking_levels,
+                primary_masking_level=args.primary_masking_level,
+                wandb_namespace=f'test_by_source/{source}'
+            )
+            save_test_metrics(results_dir / f'{source}_metrics.json', test_results)
+        print(f"Test evaluation completed; source metrics are in {results_dir}")
 
     finish_wandb()
     print(f"\n=== TRAINING COMPLETE ===")

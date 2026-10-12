@@ -821,6 +821,8 @@ def split_validation_data_by_dataset(val_dataloader):
                 dataset_name = 'nieuwland'
             elif 'alice' in dataset_source.lower():
                 dataset_name = 'alice'
+            elif 'authentic_query' in dataset_source.lower() or 'task' in dataset_source.lower():
+                dataset_name = 'authentic_query'
             elif 'dataset_1' in dataset_source.lower():
                 # Based on your script: dataset_1 = nieuwland
                 dataset_name = 'nieuwland'
@@ -1707,7 +1709,7 @@ def train_model(model, train_dataloader, val_dataloader, optimizer, num_epochs,
 
 def test_model(model, test_dataloader, device, debug=False,
                test_masking_levels=[0, 25, 50, 75, 90, 100],
-               primary_masking_level=90):
+               primary_masking_level=90, wandb_namespace=None):
     """
     Comprehensive test evaluation with MULTI-MASKING support
 
@@ -1815,7 +1817,10 @@ def test_model(model, test_dataloader, device, debug=False,
         all_test_metrics.update(summary_metrics)
 
         # Log all metrics to wandb
-        wandb.log(all_test_metrics)
+        if wandb_namespace:
+            wandb.log({f'{wandb_namespace}/{key}': value for key, value in all_test_metrics.items()})
+        else:
+            wandb.log(all_test_metrics)
 
         # Print comprehensive multi-masking summary
         print_multi_masking_test_summary(all_test_metrics, test_masking_levels, primary_masking_level)

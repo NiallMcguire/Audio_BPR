@@ -65,10 +65,11 @@ class SimpleTextEncoder(nn.Module):
             padding_mask = ~attention_mask.bool()
             encoded = self.encoder(embedded, src_key_padding_mask=padding_mask)
         else:
-            # For simple/complex: mean pooling over sequence, then apply MLP
-            mask_expanded = attention_mask.unsqueeze(-1).float()
-            pooled = (embedded * mask_expanded).sum(dim=1) / (mask_expanded.sum(dim=1) + 1e-8)
-            encoded = self.encoder(pooled).unsqueeze(1)  # [batch, 1, hidden_dim]
+            # Keep token positions so downstream CLS/mean/max/multi pooling
+            # sees representations aligned with the tokenizer attention mask.
+            encoded = self.encoder(embedded)
+            mask_expanded = attention_mask.unsqueeze(-1).to(encoded.dtype)
+            encoded = encoded * mask_expanded
 
         return encoded
 
@@ -143,10 +144,9 @@ class SimplifiedBrainRetrieval(nn.Module):
         if global_eeg_dims is not None and query_type == 'eeg':
             num_words, time_samples, channels = global_eeg_dims
             input_size = time_samples * channels
-            # FIXED: Get actual device from existing parameters
-            device = next(self.text_projection.parameters()).device if hasattr(self.text_projection,
-                                                                               'weight') else torch.device(
-                'cuda' if torch.cuda.is_available() else 'cpu')
+            # Initialize on the model's current device; create_model moves the
+            # complete model to the requested device immediately afterward.
+            device = next(self.parameters()).device
             self.eeg_encoder = self._create_eeg_encoder(input_size, device)
             print(f"✓ Initialized EEG encoder during model creation with input size {input_size} on device {device}")
         else:
