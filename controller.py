@@ -64,7 +64,8 @@ def handle_multiple_datasets(data_paths, max_eeg_len):
 def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_len,
                        train_ratio, holdout_subjects, training_masking_level,
                        global_eeg_dims=None, combined_dataset=None,
-                       pair_split_seed=42, balance_sources=False):
+                       pair_split_seed=42, balance_sources=False,
+                       split_strategy='pair'):
     """Create training, validation, and test dataloaders"""
 
     # Load each source once. Reopening a very large .npy three times for train,
@@ -89,7 +90,8 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
         max_text_len=max_text_len, max_eeg_len=max_eeg_len, split='train',
         train_ratio=train_ratio, global_eeg_dims=global_eeg_dims,
         dataset_type='original', holdout_subjects=holdout_subjects,
-        initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed
+        initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed,
+        split_strategy=split_strategy
     )
 
     val_dataset = DynamicMaskingDataloader(
@@ -97,7 +99,8 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
         max_text_len=max_text_len, max_eeg_len=max_eeg_len, split='val',
         train_ratio=train_ratio, global_eeg_dims=global_eeg_dims,
         dataset_type='original', holdout_subjects=holdout_subjects,
-        initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed
+        initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed,
+        split_strategy=split_strategy
     )
 
     test_dataset = DynamicMaskingDataloader(
@@ -105,14 +108,22 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
         max_text_len=max_text_len, max_eeg_len=max_eeg_len, split='test',
         train_ratio=train_ratio, global_eeg_dims=global_eeg_dims,
         dataset_type='original', holdout_subjects=holdout_subjects,
-        initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed
+        initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed,
+        split_strategy=split_strategy
     )
 
     train_sampler = None
     train_sources = [pair.get('dataset_source', 'unknown') for pair in train_dataset.processed_pairs]
+    train_groups = [pair.get('training_source', source)
+                    for pair, source in zip(train_dataset.processed_pairs, train_sources)]
     source_counts = {source: train_sources.count(source) for source in set(train_sources)}
-    if balance_sources and len(source_counts) > 1:
-        weights = torch.tensor([1.0 / source_counts[source] for source in train_sources], dtype=torch.double)
+    group_sources = {group: {source for source, pair_group in zip(train_sources, train_groups)
+                             if pair_group == group} for group in set(train_groups)}
+    if balance_sources and (len(set(train_groups)) > 1 or len(set(train_sources)) > 1):
+        weights = torch.tensor([
+            1.0 / (len(group_sources) * len(group_sources[group]) * source_counts[source])
+            for source, group in zip(train_sources, train_groups)
+        ], dtype=torch.double)
         generator = torch.Generator().manual_seed(pair_split_seed)
         train_sampler = WeightedRandomSampler(weights, num_samples=len(train_sources), replacement=True,
                                               generator=generator)
@@ -208,6 +219,10 @@ def main():
                         help='Use subject-based train/val/test split')
     parser.add_argument('--balance_sources', action='store_true',
                         help='Sample mixed-source training pairs with equal source probability')
+    parser.add_argument('--split-strategy', choices=('pair', 'target'), default='pair',
+                        help='Pair-level split or leakage-check split grouped by target')
+    parser.add_argument('--multi-positive-loss', action='store_true',
+                        help='Treat repeated in-batch examples of the same target document as positives')
 
     # Masking arguments
     parser.add_argument('--training_masking_level', type=int, default=90,
@@ -317,7 +332,8 @@ def main():
         global_eeg_dims=global_eeg_dims,
         combined_dataset=combined_dataset,
         pair_split_seed=args.seed,
-        balance_sources=args.balance_sources
+        balance_sources=args.balance_sources,
+        split_strategy=args.split_strategy
     )
 
     # Create experiment configuration
@@ -335,7 +351,9 @@ def main():
         'holdout_subjects': args.holdout_subjects,
         'pair_level_split': not args.holdout_subjects,
         'pair_split_seed': args.seed,
+        'split_strategy': args.split_strategy,
         'balance_sources': args.balance_sources,
+        'multi_positive_loss': args.multi_positive_loss,
         'training_masking_level': args.training_masking_level,
         'enable_multi_masking_validation': args.enable_multi_masking_validation,
         'validation_masking_levels': args.validation_masking_levels,
@@ -375,6 +393,7 @@ def main():
 
     if not args.use_pretrained_text:
         model.set_tokenizer_vocab_size(len(tokenizer))
+    model.multi_positive_loss = args.multi_positive_loss
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())

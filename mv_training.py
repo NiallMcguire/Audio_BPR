@@ -143,7 +143,8 @@ def cross_encoder_validation_step(model, batch, device):
 # DUAL-ENCODER SPECIFIC FUNCTIONS
 # ==========================================
 
-def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, temperature=0.07):
+def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, temperature=0.07,
+                             positive_ids=None):
     """Compute contrastive loss for retrieval - works with any query type"""
 
     # Handle both list and tensor returns based on pooling strategy
@@ -184,11 +185,21 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
             sim = compute_similarity([query_i], [doc_j], pooling_strategy, temperature=1.0)
             logits[i, j] = sim[0] / temperature
 
-    # Labels: positive pairs are on the diagonal
-    labels = torch.arange(batch_size, device=device)
-
-    # Cross-entropy loss
-    loss = F.cross_entropy(logits, labels)
+    if positive_ids is None:
+        # Standard one-positive-per-row InfoNCE.
+        labels = torch.arange(batch_size, device=device)
+        loss = F.cross_entropy(logits, labels)
+    else:
+        if len(positive_ids) != batch_size:
+            raise ValueError("positive_ids must contain one document ID per query")
+        positive_mask = torch.tensor(
+            [[left == right for right in positive_ids] for left in positive_ids],
+            dtype=torch.bool, device=device,
+        )
+        if not positive_mask.any(dim=1).all():
+            raise ValueError("Every query must have at least one in-batch positive document")
+        positive_logits = logits.masked_fill(~positive_mask, float('-inf'))
+        loss = (torch.logsumexp(logits, dim=1) - torch.logsumexp(positive_logits, dim=1)).mean()
 
     return loss, similarities
 
@@ -264,10 +275,14 @@ def dual_encoder_train_step(model, batch, optimizer, device, step_num, debug=Fal
                 print(f"    {key}: {value.shape if value is not None else 'None'}")
 
     # Compute contrastive loss
+    positive_ids = None
+    if getattr(model, 'multi_positive_loss', False):
+        positive_ids = [item.get('document_id') for item in batch['metadata']]
     loss, query_sims = compute_contrastive_loss(
         outputs['query_vectors'],
         outputs['doc_vectors'],
-        model.pooling_strategy
+        model.pooling_strategy,
+        positive_ids=positive_ids,
     )
 
     # Compute alignment metrics
@@ -339,10 +354,14 @@ def dual_encoder_validation_step(model, batch, device):
         outputs = model(eeg_queries, text_queries, docs, eeg_mv_masks)
 
         # Compute loss and metrics
+        positive_ids = None
+        if getattr(model, 'multi_positive_loss', False):
+            positive_ids = [item.get('document_id') for item in batch['metadata']]
         loss, query_sims = compute_contrastive_loss(
             outputs['query_vectors'],
             outputs['doc_vectors'],
-            model.pooling_strategy
+            model.pooling_strategy,
+            positive_ids=positive_ids,
         )
 
         metrics = compute_alignment_metrics(
@@ -393,19 +412,21 @@ def build_document_database(val_dataloader):
     for batch in val_dataloader:
         for sample_idx, metadata in enumerate(batch['metadata']):
             doc_text = metadata['document_text'].strip()
+            document_id = metadata.get('document_id') or doc_text
 
             if doc_text:
                 # Add to unique docs if not already present
-                if doc_text not in unique_docs:
+                if document_id not in unique_docs:
                     unique_doc_idx = len(unique_docs)
-                    unique_docs[doc_text] = {
+                    unique_docs[document_id] = {
                         'idx': unique_doc_idx,
+                        'document_id': document_id,
                         'text': doc_text,
                         'input_ids': batch['docs']['input_ids'][sample_idx].clone(),
                         'attention_mask': batch['docs']['attention_mask'][sample_idx].clone()
                     }
                 else:
-                    unique_doc_idx = unique_docs[doc_text]['idx']
+                    unique_doc_idx = unique_docs[document_id]['idx']
 
                 query_to_doc_mapping[query_idx] = unique_doc_idx
             query_idx += 1
@@ -713,6 +734,14 @@ def perform_ranking_validation(model, val_dataloader, device, epoch_num, subset_
     # Main combined validation
     print(f"\n=== VALIDATION RANKING (Epoch {epoch_num}) ===")
 
+    if dataset_sources_info['has_multiple']:
+        print("Skipping cross-source candidate ranking; evaluating each source independently.")
+        dataset_metrics = perform_dataset_specific_ranking(
+            model, val_dataloader, device, epoch_num, subset_size=100, prefix='val_ranking/dataset'
+        )
+        wandb.log(dataset_metrics)
+        return dataset_metrics
+
     doc_list, query_to_doc_mapping = build_document_database(val_dataloader)
 
     if len(doc_list) == 0 or len(query_to_doc_mapping) == 0:
@@ -817,7 +846,9 @@ def split_validation_data_by_dataset(val_dataloader):
             dataset_source = metadata.get('dataset_source', 'unknown')
 
             # More robust dataset name extraction
-            if 'nieuwland' in dataset_source.lower():
+            if dataset_source.lower() in {'authentic_question_ict', 'authentic_response_ict'}:
+                dataset_name = dataset_source.lower()
+            elif 'nieuwland' in dataset_source.lower():
                 dataset_name = 'nieuwland'
             elif 'alice' in dataset_source.lower():
                 dataset_name = 'alice'

@@ -22,18 +22,28 @@ EXPERIMENTS = (
 )
 
 
-def build_plan(audio_data: Path, visual_data: Path, task_data: Path) -> list[dict]:
+def build_plan(audio_data: Path, visual_data: Path, task_data: Path,
+               experiment_names: list[str] | tuple[str, ...] | None = None,
+               include_task_target_holdout: bool = False) -> list[dict]:
     sources = {"audio": str(audio_data.resolve()), "visual": str(visual_data.resolve()),
                "task": str(task_data.resolve())}
+    selected_names = set(experiment_names) if experiment_names is not None else None
     plan = []
     for name, source_names in EXPERIMENTS:
-        plan.append({"name": name, "sources": list(source_names),
+        if selected_names is not None and name not in selected_names:
+            continue
+        plan.append({"name": name, "sources": list(source_names), "split_strategy": "pair",
                      "data_paths": [sources[source] for source in source_names]})
+    if selected_names is not None and {row["name"] for row in plan} != selected_names:
+        raise ValueError(f"Unknown experiment names: {sorted(selected_names - {row['name'] for row in plan})}")
+    if include_task_target_holdout:
+        plan.append({"name": "task_only_target_holdout", "sources": ["task"],
+                     "data_paths": [sources["task"]], "split_strategy": "target"})
     return plan
 
 
 def _controller_command(experiment: dict, output_path: Path, python_executable: str,
-                        seed: int, epochs: int, batch_size: int, learning_rate: float,
+                        seed: int, epochs: int, patience: int, batch_size: int, learning_rate: float,
                         use_pretrained_text: bool, use_lora: bool,
                         pooling_strategy: str) -> list[str]:
     command = [python_executable, str(AUDIO_BPR_DIR / "controller.py")]
@@ -50,7 +60,7 @@ def _controller_command(experiment: dict, output_path: Path, python_executable: 
         "--batch_size", str(batch_size),
         "--lr", str(learning_rate),
         "--epochs", str(epochs),
-        "--patience", "10",
+        "--patience", str(patience),
         "--seed", str(seed),
         "--training_masking_level", "90",
         "--enable_multi_masking_validation",
@@ -58,8 +68,10 @@ def _controller_command(experiment: dict, output_path: Path, python_executable: 
         "--primary_masking_level", "90",
         "--output_dir", str(output_path),
     ])
-    if len(paths) > 1:
+    if len(paths) > 1 or "task" in experiment["sources"]:
         command.append("--balance_sources")
+    command.extend(["--split-strategy", experiment.get("split_strategy", "pair")])
+    command.append("--multi-positive-loss")
     if use_pretrained_text:
         command.append("--use_pretrained_text")
     if not use_lora:
@@ -68,7 +80,8 @@ def _controller_command(experiment: dict, output_path: Path, python_executable: 
 
 
 def _slurm_script(experiment: dict, command: list[str], output_dir: Path, partition: str,
-                  time_limit: str, memory: str, cpus: int, gpu_request: str) -> str:
+                  time_limit: str, memory: str, cpus: int, gpu_request: str,
+                  exclude_nodes: list[str] | None = None) -> str:
     log_dir = output_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     command_text = shlex.join(command)
@@ -80,6 +93,7 @@ def _slurm_script(experiment: dict, command: list[str], output_dir: Path, partit
         f"#SBATCH --mem={memory}",
         f"#SBATCH --cpus-per-task={cpus}",
         f"#SBATCH --gres={gpu_request}",
+        *([f"#SBATCH --exclude={','.join(exclude_nodes)}"] if exclude_nodes else []),
         f"#SBATCH --output={shlex.quote(str(log_dir / (experiment['name'] + '-%j.out')))}",
         f"#SBATCH --error={shlex.quote(str(log_dir / (experiment['name'] + '-%j.err')))}",
         "set -euo pipefail",
@@ -94,9 +108,11 @@ def prepare_jobs(audio_data: Path, visual_data: Path, task_data: Path, output_di
                  partition: str = "gpu", time_limit: str = "12:00:00", memory: str = "64G",
                  cpus: int = 8, gpu_request: str = "gpu:1", python_executable: str = sys.executable,
                  seed: int = 42, epochs: int = 200, batch_size: int = 32,
+                 patience: int = 10, experiment_names: list[str] | tuple[str, ...] | None = None,
                  learning_rate: float = 1e-5, use_pretrained_text: bool = True,
-                 use_lora: bool = False, pooling_strategy: str = "multi", validate_inputs: bool = False,
-                 overwrite: bool = False) -> dict:
+                 use_lora: bool = False, pooling_strategy: str = "mean", validate_inputs: bool = False,
+                 overwrite: bool = False, exclude_nodes: list[str] | None = None,
+                 include_task_target_holdout: bool = False) -> dict:
     inputs = {"audio": Path(audio_data), "visual": Path(visual_data), "task": Path(task_data)}
     if validate_inputs:
         missing = [f"{name}: {path}" for name, path in inputs.items() if not path.is_file()]
@@ -106,7 +122,10 @@ def prepare_jobs(audio_data: Path, visual_data: Path, task_data: Path, output_di
     output_dir = Path(output_dir).resolve()
     jobs_dir = output_dir / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
-    plan = build_plan(inputs["audio"], inputs["visual"], inputs["task"])
+    plan = build_plan(inputs["audio"], inputs["visual"], inputs["task"], experiment_names,
+                      include_task_target_holdout)
+    if not plan:
+        raise ValueError("Select at least one experiment")
     plan_path = output_dir / "experiment_matrix.json"
     if not overwrite and plan_path.exists():
         raise FileExistsError(f"{plan_path} exists; pass --overwrite to regenerate prepared jobs")
@@ -114,21 +133,25 @@ def prepare_jobs(audio_data: Path, visual_data: Path, task_data: Path, output_di
     for experiment in plan:
         experiment_output = output_dir / "results" / experiment["name"]
         command = _controller_command(experiment, experiment_output, python_executable, seed,
-                                      epochs, batch_size, learning_rate, use_pretrained_text, use_lora,
+                          epochs, patience, batch_size, learning_rate, use_pretrained_text, use_lora,
                                       pooling_strategy)
         script_path = jobs_dir / f"{experiment['name']}.sbatch"
         script_path.write_text(_slurm_script(experiment, command, output_dir, partition,
-                                             time_limit, memory, cpus, gpu_request), encoding="utf-8")
+                                             time_limit, memory, cpus, gpu_request, exclude_nodes), encoding="utf-8")
         script_path.chmod(0o755)
         experiment["job_script"] = str(script_path)
         experiment["output_dir"] = str(experiment_output)
-        experiment["balance_sources"] = len(experiment["sources"]) > 1
+        experiment["balance_sources"] = len(experiment["sources"]) > 1 or "task" in experiment["sources"]
 
     report = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "submitted": False,
-        "split_policy": "deterministic, source-stratified pair-level 80/10/10 (seed shared across conditions)",
+        "split_policy": "deterministic, source-stratified pair-level 80/10/10; optional Task target-grouped diagnostic",
         "training_policy": "equal-probability source sampling for mixed-source conditions",
+        "multi_positive_all_conditions": True,
+        "pooling_strategy": pooling_strategy,
+        "excluded_nodes": exclude_nodes or [],
+        "patience": patience,
         "text_encoder_policy": "pretrained ColBERT frozen (LoRA disabled)" if use_pretrained_text and not use_lora
         else "pretrained ColBERT with LoRA" if use_pretrained_text else "text encoder trained from scratch",
         "evaluation_policy": "each source's held-out queries ranked against only that source's held-out candidate passages",
@@ -140,7 +163,7 @@ def prepare_jobs(audio_data: Path, visual_data: Path, task_data: Path, output_di
     plan_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     readme = output_dir / "PREPARED_NOT_SUBMITTED.txt"
     readme.write_text(
-        "Seven Slurm job files have been generated under jobs/. No jobs were submitted.\n"
+        f"{len(plan)} Slurm job files have been generated under jobs/. No jobs were submitted.\n"
         "Review experiment_matrix.json and the data paths/resources before manually submitting any job.\n",
         encoding="utf-8",
     )
@@ -159,12 +182,19 @@ def main() -> None:
     parser.add_argument("--memory", default="64G")
     parser.add_argument("--cpus", type=int, default=8)
     parser.add_argument("--gpu-request", default="gpu:1")
+    parser.add_argument("--exclude-nodes", nargs="+", default=None,
+                        help="Slurm nodes to avoid, e.g. gpu04")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--experiments", nargs="+", choices=[name for name, _ in EXPERIMENTS],
+                        default=None, help="Subset of experiment conditions to prepare")
+    parser.add_argument("--include-task-target-holdout", action="store_true",
+                        help="Add a Task-only target-grouped leakage diagnostic")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--pooling-strategy", choices=("cls", "mean", "max", "multi"), default="multi")
+    parser.add_argument("--pooling-strategy", choices=("cls", "mean", "max", "multi"), default="mean")
     parser.add_argument("--no-pretrained-text", action="store_true")
     parser.add_argument("--use-lora", action="store_true",
                         help="Enable LoRA adapters; disabled by default for cluster compatibility")
@@ -175,10 +205,12 @@ def main() -> None:
         args.audio_data, args.visual_data, args.task_data, args.output_dir,
         partition=args.partition, time_limit=args.time, memory=args.memory,
         cpus=args.cpus, gpu_request=args.gpu_request, python_executable=args.python,
-        seed=args.seed, epochs=args.epochs, batch_size=args.batch_size,
+        seed=args.seed, epochs=args.epochs, patience=args.patience, experiment_names=args.experiments,
+        batch_size=args.batch_size,
         learning_rate=args.learning_rate, use_pretrained_text=not args.no_pretrained_text,
         use_lora=args.use_lora, pooling_strategy=args.pooling_strategy, validate_inputs=args.validate_inputs,
-        overwrite=args.overwrite,
+        overwrite=args.overwrite, exclude_nodes=args.exclude_nodes,
+        include_task_target_holdout=args.include_task_target_holdout,
     )
     print(f"Prepared {len(report['matrix'])} Slurm job scripts; no jobs submitted.")
     print(f"Plan: {Path(args.output_dir).resolve() / 'experiment_matrix.json'}")

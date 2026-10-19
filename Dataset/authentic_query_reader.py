@@ -57,9 +57,13 @@ def _matched_word_index(row: dict, question_tokens: list[str]) -> int | None:
 def _make_pair(record: dict[str, str], eeg_epochs: list[np.ndarray], source_path: Path,
                alignment_status: str, offset_seconds: float | None) -> dict:
     response = record["ground_truth_response"].strip()
+    # MNE returns [channels, samples]; BPR's EEG tensors use [time, channels]
+    # for every word/fixation, matching the Alice and Nieuwland ICT readers.
+    eeg_sequence = np.asarray([np.asarray(epoch, dtype=np.float32).T for epoch in eeg_epochs],
+                              dtype=np.float32)
     pair = {
         "query_text": record["question_text"].strip(),
-        "query_eeg": np.asarray(eeg_epochs, dtype=np.float32),
+        "query_eeg": eeg_sequence,
         "query_words": record["question_text"].split(),
         "doc_text": response,
         "doc_eeg": np.zeros((0, 0, 0), dtype=np.float32),
@@ -184,7 +188,7 @@ def build_task_pairs(dataset_dir: Path = DEFAULT_DATASET_DIR, output_path: Path 
                 if start < 0 or stop > raw.n_times:
                     counters["unaligned_fixations_outside_eeg"] += 1
                     continue
-                selected.append(raw.get_data(start=start, stop=stop).T)
+                selected.append(raw.get_data(start=start, stop=stop))
 
             counters["unaligned_trials_seen"] += 1
             counters["unaligned_fixations_matched"] += len(selected)

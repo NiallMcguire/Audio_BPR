@@ -387,36 +387,38 @@ Training produces:
 
 Please cite the original dataset papers when using these resources.
 
-## Authentic Query Mixed Experiments
+## Authentic Query ICT Experiments
 
-The extracted task data can be converted into EEG-question-to-answer pairs. Query EEG is built from fixation epochs whose word index is confidently matched to the displayed `question_text`; the target passage is `ground_truth_response`. These task pairs are marked as non-ICT, so their complete answer text is never runtime-masked.
+The task reader builds two distinct ICT sources:
+
+- **Question ICT:** fixation EEG for a sampled span of the displayed question retrieves the full question text.
+- **Response ICT:** fixation EEG for a sampled span of the response the participant saw retrieves that full displayed response. This may be the experimentally edited response, not the gold answer.
+
+Both sources use aligned question-reading and response-fixation epochs where available. P001/P002 are also included using a zero-second PsychoPy-to-EEG offset assumption; this is explicitly **unverified** because their task clock is not synchronized to EEG, and their source files are byte-identical. The manifest records these flags and any trials skipped for missing word-indexed fixation EEG.
+
+Generate separate question/response files and a combined Task file:
 
 ```bash
-python Dataset/authentic_query_reader.py \
+/usr/bin/python3 Dataset/authentic_query_ict_reader.py \
   --dataset-dir ../dataset \
-  --output ../dataset/authentic_query_task_pairs.npy \
-  --unaligned-clock-offset-seconds 0
+  --output-dir ../dataset/authentic_task_ict \
+  --unaligned-clock-offset-seconds 0 \
+  --seed 42 --query-ratio 0.3 --pairs-per-trial 2
 ```
 
-P001 and P002 are included using the supplied offset as an **unverified assumption** because their PsychoPy clock is not synchronized to EEG. Their byte-identical source files also do not establish independent participant identity. The generated manifest records this, as well as trials skipped for missing answer rows or question-word EEG.
+The outputs are `authentic_question_ict_pairs.npy`, `authentic_response_ict_pairs.npy`, and their union `authentic_task_ict_pairs.npy`. The union keeps question and response ICT as separate evaluation sources while treating them as one Task modality for balanced mixed training.
 
-Prepare seven Slurm job files for the comparison matrix:
-
-1. Task only
-2. Audio only
-3. Visual only
-4. Audio + visual
-5. Audio + task
-6. Visual + task
-7. Audio + visual + task
+Prepare the seven matched mean-pooling conditions, with patience 5 and multi-positive loss in every condition. Add the Task target-grouped leakage diagnostic with `--include-task-target-holdout`:
 
 ```bash
-python experiment_scheduler.py \
-  --audio-data /path/to/alice_ict_pairs.npy \
-  --visual-data /path/to/nieuwland_ict_pairs.npy \
-  --task-data ../dataset/authentic_query_task_pairs.npy \
-  --output-dir prepared_experiments
+/usr/bin/python3 experiment_scheduler.py \
+  --audio-data /path/to/alice_ict_pairs_RUNTIME_MASKING.npy \
+  --visual-data /path/to/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
+  --task-data ../dataset/authentic_task_ict/authentic_task_ict_pairs.npy \
+  --output-dir prepared_experiments \
+  --pooling-strategy mean --patience 5 \
+  --include-task-target-holdout
 ```
 
-This command only writes the experiment matrix and `.sbatch` files; it does not submit jobs. Pair-level train/validation/test assignments are deterministic and stratified per source, and the same source test pairs are reused across mixtures. Mixed-source training samples sources with equal probability. Test evaluation ranks each source's queries against only that source's held-out candidate passages; per-source metrics are written under each run's `test_by_source/` directory. The task source remains unmasked at every masking level, while Audio and Visual ICT passages use the configured span masking.
+The scheduler writes scripts and a plan but does not submit jobs. The seven primary conditions use deterministic, source-stratified pair-level splits with a shared seed. The optional Task diagnostic groups all spans from one question across question and response ICT into a single split. Mixed training balances Audio, Visual, and Task; within Task it balances question ICT and response ICT. All conditions use multi-positive loss. Mixed-source validation and test ranking are source-specific, with stable held-out candidate identities across masking levels; question and response Task metrics are reported separately.
 
