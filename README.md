@@ -389,36 +389,42 @@ Please cite the original dataset papers when using these resources.
 
 ## Authentic Query ICT Experiments
 
-The task reader builds two distinct ICT sources:
+The task reader builds three linked training sources:
 
 - **Question ICT:** fixation EEG for a sampled span of the displayed question retrieves the full question text.
 - **Response ICT:** fixation EEG for a sampled span of the response the participant saw retrieves that full displayed response. This may be the experimentally edited response, not the gold answer.
+- **Query-to-response:** fixation EEG for a sampled span of the displayed question retrieves that trial's exact `response_seen` text. This is the primary Task evaluation source.
 
-Both sources use aligned question-reading and response-fixation epochs where available. P001/P002 are also included using a zero-second PsychoPy-to-EEG offset assumption; this is explicitly **unverified** because their task clock is not synchronized to EEG, and their source files are byte-identical. The manifest records these flags and any trials skipped for missing word-indexed fixation EEG.
+Pairs use aligned question-reading and response-fixation epochs where available. The builder also preserves P001/P002 examples made using a zero-second PsychoPy-to-EEG offset assumption; this is explicitly **unverified** because their task clock is not synchronized to EEG, and their source files are byte-identical. Full files retain these examples with flags for sensitivity analyses. Separate `_aligned_pairs.npy` files contain only `aligned_word_index` samples and are the inputs for primary experiments. The manifest records alignment and trials skipped for missing word-indexed fixation EEG.
 
 Generate separate question/response files and a combined Task file:
 
 ```bash
 /usr/bin/python3 Dataset/authentic_query_ict_reader.py \
   --dataset-dir ../dataset \
-  --output-dir ../dataset/authentic_task_ict \
+  --output-dir ../dataset/authentic_task_ict_query_response \
   --unaligned-clock-offset-seconds 0 \
   --seed 42 --query-ratio 0.3 --pairs-per-trial 2
 ```
 
-The outputs are `authentic_question_ict_pairs.npy`, `authentic_response_ict_pairs.npy`, and their union `authentic_task_ict_pairs.npy`. The union keeps question and response ICT as separate evaluation sources while treating them as one Task modality for balanced mixed training.
+The builder writes full files `authentic_query_response_pairs.npy`, `authentic_question_ict_pairs.npy`, `authentic_response_ict_pairs.npy`, and `authentic_task_ict_pairs.npy`, plus aligned-only counterparts named with `_aligned_pairs.npy`. Query-to-response pairs reuse the sampled question-reading EEG unchanged and use the corresponding displayed response, not `ground_truth_response`. The union keeps all three sources separate for evaluation and identifies the Task modality for balanced mixed training. The question ICT and query-to-response pair for a sampled question span share a query-group ID; the multi-positive loss treats both documents as positives if they occur in the same batch.
 
-Prepare the seven matched mean-pooling conditions, with patience 5 and multi-positive loss in every condition. Add the Task target-grouped leakage diagnostic with `--include-task-target-holdout`:
+Prepare and submit the seven response-retrieval ablations:
 
 ```bash
 /usr/bin/python3 experiment_scheduler.py \
   --audio-data /path/to/alice_ict_pairs_RUNTIME_MASKING.npy \
   --visual-data /path/to/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
-  --task-data ../dataset/authentic_task_ict/authentic_task_ict_pairs.npy \
+  --task-data ../dataset/authentic_task_ict_query_response/authentic_task_ict_aligned_pairs.npy \
   --output-dir prepared_experiments \
   --pooling-strategy mean --patience 5 \
-  --include-task-target-holdout
+  --wandb-project "Authentic Queries BPR" \
+  --validate-inputs
 ```
 
-The scheduler writes scripts and a plan but does not submit jobs. The seven primary conditions use deterministic, source-stratified pair-level splits with a shared seed. The optional Task diagnostic groups all spans from one question across question and response ICT into a single split. Mixed training balances Audio, Visual, and Task; within Task it balances question ICT and response ICT. All conditions use multi-positive loss. Mixed-source validation and test ranking are source-specific, with stable held-out candidate identities across masking levels; question and response Task metrics are reported separately.
+The seven conditions are `query_response_only`, `query_response_plus_question_ict`, `query_response_plus_response_ict`, `all_task_sources`, `all_task_sources_audio`, `all_task_sources_visual`, and `all_task_sources_audio_visual`. Every run trains on query-reading EEG to the corresponding displayed response; each added source is an ablation. Deterministic 80/10/10 splits group by normalized Task question text across participants and all three pair types, using seed 42 shared across arms. Multi-source training balances source groups; the three Task types are balanced within the Task modality. Checkpoint selection and early stopping use only the held-out `authentic_query_response` validation source. The primary comparison uses the same held-out `authentic_query_response` candidate pool in every arm, and each arm also reports source-specific retrieval metrics and a Gaussian-noise baseline.
+
+Runs use the established BPR setup: dual encoder, simple EEG encoder (hidden dimension 768), mean pooling, frozen pretrained ColBERT-v2 text encoder, LoRA disabled, batch size 32, AdamW learning rate `1e-5`, maximum 200 epochs, patience 5, and seed 42. ICT targets use 90% training masking and validation at 0/25/50/75/90/100%; the query-to-response target is never masked. Slurm requests one GPU, 12 CPUs, 128 GB RAM, and 24 hours, excluding `gpu04`. W&B runs are named `aqbpr_<condition>_mean_seed42_dynamic_mask` in the requested project.
+
+The scheduler only prepares scripts and selects the aligned-only Task pair files. Submit them after reviewing the plan with `for job in prepared_experiments/jobs/*.sbatch; do sbatch "$job"; done`.
 

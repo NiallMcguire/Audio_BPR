@@ -144,7 +144,7 @@ def cross_encoder_validation_step(model, batch, device):
 # ==========================================
 
 def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, temperature=0.07,
-                             positive_ids=None):
+                             positive_ids=None, query_group_ids=None):
     """Compute contrastive loss for retrieval - works with any query type"""
 
     # Handle both list and tensor returns based on pooling strategy
@@ -185,17 +185,29 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
             sim = compute_similarity([query_i], [doc_j], pooling_strategy, temperature=1.0)
             logits[i, j] = sim[0] / temperature
 
-    if positive_ids is None:
+    if positive_ids is None and query_group_ids is None:
         # Standard one-positive-per-row InfoNCE.
         labels = torch.arange(batch_size, device=device)
         loss = F.cross_entropy(logits, labels)
     else:
-        if len(positive_ids) != batch_size:
+        if positive_ids is not None and len(positive_ids) != batch_size:
             raise ValueError("positive_ids must contain one document ID per query")
-        positive_mask = torch.tensor(
-            [[left == right for right in positive_ids] for left in positive_ids],
-            dtype=torch.bool, device=device,
-        )
+        if query_group_ids is not None and len(query_group_ids) != batch_size:
+            raise ValueError("query_group_ids must contain one group ID per query")
+        positive_mask = torch.zeros((batch_size, batch_size), dtype=torch.bool, device=device)
+        for row in range(batch_size):
+            for column in range(batch_size):
+                same_document = (
+                    positive_ids is not None
+                    and positive_ids[row] not in (None, "")
+                    and positive_ids[row] == positive_ids[column]
+                )
+                same_query = (
+                    query_group_ids is not None
+                    and query_group_ids[row] not in (None, "")
+                    and query_group_ids[row] == query_group_ids[column]
+                )
+                positive_mask[row, column] = same_document or same_query
         if not positive_mask.any(dim=1).all():
             raise ValueError("Every query must have at least one in-batch positive document")
         positive_logits = logits.masked_fill(~positive_mask, float('-inf'))
@@ -276,13 +288,16 @@ def dual_encoder_train_step(model, batch, optimizer, device, step_num, debug=Fal
 
     # Compute contrastive loss
     positive_ids = None
+    query_group_ids = None
     if getattr(model, 'multi_positive_loss', False):
         positive_ids = [item.get('document_id') for item in batch['metadata']]
+        query_group_ids = [item.get('query_group_id') for item in batch['metadata']]
     loss, query_sims = compute_contrastive_loss(
         outputs['query_vectors'],
         outputs['doc_vectors'],
         model.pooling_strategy,
         positive_ids=positive_ids,
+        query_group_ids=query_group_ids,
     )
 
     # Compute alignment metrics
@@ -355,13 +370,16 @@ def dual_encoder_validation_step(model, batch, device):
 
         # Compute loss and metrics
         positive_ids = None
+        query_group_ids = None
         if getattr(model, 'multi_positive_loss', False):
             positive_ids = [item.get('document_id') for item in batch['metadata']]
+            query_group_ids = [item.get('query_group_id') for item in batch['metadata']]
         loss, query_sims = compute_contrastive_loss(
             outputs['query_vectors'],
             outputs['doc_vectors'],
             model.pooling_strategy,
             positive_ids=positive_ids,
+            query_group_ids=query_group_ids,
         )
 
         metrics = compute_alignment_metrics(
@@ -1499,6 +1517,8 @@ def initialize_wandb(config):
 
         run_name = f"dual_{query_type}_{pooling_strategy}_{eeg_arch}{model_suffix}{split_suffix}_{dataset_name}"
 
+        run_name = config.get('wandb_run_name') or run_name
+
     # Add multi-masking info to run name if enabled
     if config.get('enable_multi_masking_validation', False):
         run_name += "_dynamic_mask"
@@ -1514,6 +1534,9 @@ def initialize_wandb(config):
             'holdout-subjects' if holdout_subjects else 'random-split',
             f'dataset-{dataset_name}',
             'dynamic-multi-masking-validation']
+    if config.get('experiment_name'):
+        tags.extend(['authentic-query-response', 'ablation', f"condition-{config['experiment_name']}"])
+        tags.extend(f"source-{source}" for source in config.get('ablation_sources', []))
 
     # NEW: Add query type specific tags
     if query_type == 'text':
@@ -1522,15 +1545,23 @@ def initialize_wandb(config):
         tags.extend(['eeg', 'eeg-query'])
 
     wandb.init(
-        project="ECIR2026",
+        project=config.get('wandb_project', 'ECIR2026'),
         name=run_name,
         config={
+            'experiment_name': config.get('experiment_name'),
+            'ablation_sources': config.get('ablation_sources', []),
+            'data_files': config.get('data_files', []),
+            'wandb_project': config.get('wandb_project', 'ECIR2026'),
+            'primary_task_source': config.get('primary_task_source'),
+            'primary_eval_source': config.get('primary_eval_source'),
+            'query_group_multi_positive': config.get('query_group_multi_positive', False),
             'encoder_type': encoder_type,
             'query_type': query_type,
             'pooling_strategy': pooling_strategy,
             'holdout_subjects': holdout_subjects,
             'fold': fold,
             'split_method': 'holdout_subjects' if holdout_subjects else 'random_samples',
+            'split_strategy': config.get('split_strategy', 'pair'),
             'dataset_name': dataset_name,
 
             # Model config
@@ -1571,6 +1602,7 @@ def initialize_wandb(config):
 
             # Experiment config
             'seed': config.get('seed', 42),
+            'multi_positive_loss': config.get('multi_positive_loss', False),
             'loss_type': 'bce' if encoder_type == 'cross' else 'contrastive',
             'similarity_function': f'{pooling_strategy}_similarity',
             'is_text_baseline': query_type == 'text'  # NEW

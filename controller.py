@@ -184,6 +184,15 @@ def create_source_test_loaders(test_dataloader):
     }
 
 
+def select_primary_validation_loader(val_dataloader, primary_source=None):
+    if primary_source is None:
+        return val_dataloader
+    source_loaders = create_source_test_loaders(val_dataloader)
+    if primary_source not in source_loaders:
+        raise ValueError(f"Primary validation source {primary_source!r} is absent from validation data")
+    return source_loaders[primary_source]
+
+
 def save_test_metrics(path, results):
     """Write source-specific test metrics in JSON-friendly form."""
     path.write_text(json.dumps(results, indent=2, default=float) + '\n', encoding='utf-8')
@@ -237,6 +246,16 @@ def main():
     parser.add_argument('--output_dir', type=str, required=True,
                         help='Output directory for results')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--experiment-name', type=str, default=None,
+                        help='Named ablation condition used in W&B metadata')
+    parser.add_argument('--ablation-sources', nargs='+', default=None,
+                        help='Named data sources included in this ablation')
+    parser.add_argument('--wandb-project', type=str, default='ECIR2026',
+                        help='Weights & Biases project name')
+    parser.add_argument('--wandb-run-name', type=str, default=None,
+                        help='Explicit Weights & Biases run name')
+    parser.add_argument('--primary-eval-source', type=str, default=None,
+                        help='Source used for validation and early stopping in ablation runs')
 
     # Additional arguments (with defaults for paper reproduction)
     parser.add_argument('--max_text_len', type=int, default=256, help='Max text sequence length')
@@ -336,11 +355,21 @@ def main():
         split_strategy=args.split_strategy
     )
 
+    training_val_dataloader = val_dataloader
+    if args.primary_eval_source:
+        training_val_dataloader = select_primary_validation_loader(val_dataloader, args.primary_eval_source)
+        print(f"Early stopping and checkpoint selection use {args.primary_eval_source} only")
+
     # Create experiment configuration
     config = {
         'experiment_type': 'brain_passage_retrieval',
+        'experiment_name': args.experiment_name,
+        'ablation_sources': args.ablation_sources or [],
+        'wandb_project': args.wandb_project,
+        'wandb_run_name': args.wandb_run_name,
         'timestamp': datetime.now().isoformat(),
         'dataset': dataset_name,
+        'dataset_name': dataset_name,
         'pooling_strategy': args.pooling_strategy,
         'encoder_type': args.encoder_type,
         'query_type': args.query_type,
@@ -354,14 +383,27 @@ def main():
         'split_strategy': args.split_strategy,
         'balance_sources': args.balance_sources,
         'multi_positive_loss': args.multi_positive_loss,
+        'query_group_multi_positive': args.multi_positive_loss,
+        'primary_task_source': 'authentic_query_response' if args.experiment_name else None,
+        'primary_eval_source': args.primary_eval_source,
         'training_masking_level': args.training_masking_level,
         'enable_multi_masking_validation': args.enable_multi_masking_validation,
         'validation_masking_levels': args.validation_masking_levels,
         'seed': args.seed,
         'device': str(device),
         'train_samples': len(train_dataloader.dataset),
-        'val_samples': len(val_dataloader.dataset),
+        'val_samples': len(training_val_dataloader.dataset),
+        'all_source_val_samples': len(val_dataloader.dataset),
         'test_samples': len(test_dataloader.dataset),
+        'eeg_arch': args.eeg_arch,
+        'data_files': [Path(path).name for path in (args.data_paths or [args.data_path])],
+        'hidden_dim': args.hidden_dim,
+        'num_vectors': args.num_vectors,
+        'colbert_model_name': args.colbert_model_name,
+        'use_pretrained_text': args.use_pretrained_text,
+        'use_lora': not args.no_lora,
+        'lora_r': args.lora_r,
+        'lora_alpha': args.lora_alpha,
     }
 
     print(f"\n=== EXPERIMENT CONFIGURATION ===")
@@ -412,7 +454,7 @@ def main():
     trained_model = train_model(
         model=model,
         train_dataloader=train_dataloader,
-        val_dataloader=val_dataloader,
+        val_dataloader=training_val_dataloader,
         optimizer=optimizer,
         num_epochs=args.epochs,
         patience=args.patience,

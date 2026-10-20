@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -20,7 +21,7 @@ except ImportError:
 
 
 DEFAULT_DATASET_DIR = Path(__file__).resolve().parents[2] / "dataset"
-DEFAULT_OUTPUT_DIR = DEFAULT_DATASET_DIR / "authentic_task_ict"
+DEFAULT_OUTPUT_DIR = DEFAULT_DATASET_DIR / "authentic_task_ict_query_response"
 
 
 def _sample_spans(tokens: list[str], events: list[tuple[int, np.ndarray, float]], *,
@@ -59,20 +60,50 @@ def _sample_spans(tokens: list[str], events: list[tuple[int, np.ndarray, float]]
 
 def _pair(record: dict[str, str], kind: str, full_text: str, tokens: list[str],
           span: tuple[int, int, list[np.ndarray]], source_path: Path,
-          alignment_status: str, offset_seconds: float | None) -> dict:
+          alignment_status: str, offset_seconds: float | None,
+          target_type: str = "ict") -> dict:
     start, end, eeg_rows = span
-    pair_source = "authentic_question_ict" if kind == "question" else "authentic_response_ict"
-    eeg_sequence = np.asarray([np.asarray(eeg, dtype=np.float32).T for eeg in eeg_rows], dtype=np.float32)
     query_text = " ".join(tokens[start:end])
-    return {
+    query_words = tokens[start:end]
+    doc_text = full_text
+    doc_words = tokens
+    pair_source = "authentic_question_ict" if kind == "question" else "authentic_response_ict"
+    supports_runtime_masking = True
+    document_id = None
+    if kind == "question":
+        query_group_parts = (record["participant_id"], record["session_id"], record["part"],
+                             record["trial"], record["question_id"], start, end)
+        query_group_id = hashlib.sha256("\0".join(map(str, query_group_parts)).encode("utf-8")).hexdigest()
+    else:
+        query_group_id = ""
+    normalized_question = " ".join(record["question_text"].split()).casefold()
+    split_group_id = "task_query:" + hashlib.sha256(normalized_question.encode("utf-8")).hexdigest()
+
+    if kind == "question" and target_type == "response":
+        doc_text = record["response_seen"].strip()
+        if not doc_text:
+            return None
+        doc_words = doc_text.split()
+        pair_source = "authentic_query_response"
+        supports_runtime_masking = False
+        normalized_response = " ".join(doc_text.split()).casefold()
+        response_hash = hashlib.sha256(normalized_response.encode("utf-8")).hexdigest()
+        document_id = f"authentic_task_response:{response_hash}"
+    elif kind == "response":
+        normalized_response = " ".join(doc_text.split()).casefold()
+        response_hash = hashlib.sha256(normalized_response.encode("utf-8")).hexdigest()
+        document_id = f"authentic_task_response:{response_hash}"
+
+    eeg_sequence = np.asarray([np.asarray(eeg, dtype=np.float32).T for eeg in eeg_rows], dtype=np.float32)
+    pair = {
         "query_text": query_text,
         "query_eeg": eeg_sequence,
-        "query_words": tokens[start:end],
-        "doc_text": full_text,
+        "query_words": query_words,
+        "doc_text": doc_text,
         "doc_eeg": np.zeros((0, 0, 0), dtype=np.float32),
-        "doc_words": tokens,
-        "full_sentence_text": full_text,
-        "full_sentence_words": tokens,
+        "doc_words": doc_words,
+        "full_sentence_text": doc_text,
+        "full_sentence_words": doc_words,
         "query_start_idx": start,
         "query_end_idx": end,
         "participant_id": record["participant_id"],
@@ -81,8 +112,9 @@ def _pair(record: dict[str, str], kind: str, full_text: str, tokens: list[str],
         "trial": int(record["trial"]),
         "sentence_id": int(record["trial"]),
         "question_id": record["question_id"],
-        "split_group_id": record["question_id"],
-        "query_kind": kind,
+        "split_group_id": split_group_id,
+        "query_group_id": query_group_id,
+        "query_kind": "question_to_response" if pair_source == "authentic_query_response" else kind,
         "condition": record["condition"],
         "chatbot_condition": record["chatbot_condition"],
         "response_seen": record["response_seen"],
@@ -91,23 +123,26 @@ def _pair(record: dict[str, str], kind: str, full_text: str, tokens: list[str],
         "answer_provenance": record["answer_provenance"],
         "dataset_source": pair_source,
         "training_source": "authentic_query",
-        "supports_runtime_masking": True,
+        "supports_runtime_masking": supports_runtime_masking,
         "alignment_status": alignment_status,
         "unaligned_clock_offset_seconds": offset_seconds,
         "source_identity_group": "P001_P002_byte_identical" if record["participant_id"] in {"P001", "P002"} else "",
         "source_eeg_file": str(source_path),
     }
+    if document_id is not None:
+        pair["document_id"] = document_id
+    return pair
 
 
 def _build_from_aligned_epochs(epochs_path: Path, participant: str, session: str,
                                records: dict, kind: str, random_seed: int,
                                query_ratio: float, min_query_length: int,
                                max_query_length: int, pairs_per_trial: int,
-                               min_fixations: int, counters: defaultdict) -> list[dict]:
+                               min_fixations: int, counters: defaultdict) -> tuple[list[dict], list[dict]]:
     epochs = mne.read_epochs(epochs_path, preload=True, verbose="ERROR")
     if epochs.metadata is None:
         counters[f"{kind}_aligned_sessions_missing_metadata"] += 1
-        return []
+        return [], []
     data = epochs.get_data(copy=False)
     grouped = defaultdict(list)
     for event_index, row in enumerate(epochs.metadata.to_dict("records")):
@@ -115,6 +150,8 @@ def _build_from_aligned_epochs(epochs_path: Path, participant: str, session: str
         grouped[key].append((row, data[event_index]))
 
     output = []
+    query_response_pairs = []
+    query_response_pairs = []
     for key, rows in grouped.items():
         record = records.get(key)
         if record is None:
@@ -137,21 +174,28 @@ def _build_from_aligned_epochs(epochs_path: Path, participant: str, session: str
                               counters=counters)
         for span in spans:
             output.append(_pair(record, kind, full_text, tokens, span, epochs_path, "aligned_word_index", None))
-    return output
+            if kind == "question":
+                pair = _pair(record, kind, full_text, tokens, span, epochs_path,
+                             "aligned_word_index", None, target_type="response")
+                if pair is not None:
+                    query_response_pairs.append(pair)
+                else:
+                    counters["question_spans_missing_displayed_response"] += 1
+    return output, query_response_pairs
 
 
 def _build_from_unaligned_raw(participant_dir: Path, records: dict, kind: str,
                               unaligned_clock_offset_seconds: float, random_seed: int,
                               query_ratio: float, min_query_length: int,
                               max_query_length: int, pairs_per_trial: int,
-                              min_fixations: int, counters: defaultdict) -> list[dict]:
+                              min_fixations: int, counters: defaultdict) -> tuple[list[dict], list[dict]]:
     participant = participant_dir.name
     task_dir = participant_dir / "unaligned_task_export"
     raw_path = task_dir / f"{participant}_unaligned_raw.fif"
     fixation_path = task_dir / f"{participant}_{'reading' if kind == 'question' else 'response'}_fixations.csv"
     if not raw_path.is_file() or not fixation_path.is_file():
         counters[f"{kind}_unaligned_participant_missing_inputs"] += 1
-        return []
+        return [], []
     raw = mne.io.read_raw_fif(raw_path, preload=True, verbose="ERROR")
     rows_by_trial = defaultdict(list)
     for row in _read_rows(fixation_path):
@@ -163,6 +207,7 @@ def _build_from_unaligned_raw(participant_dir: Path, records: dict, kind: str,
     epoch_tmin = -0.2
     epoch_samples = int(round(1.0 * sfreq)) + 1
     output = []
+    query_response_pairs = []
     for key, rows in rows_by_trial.items():
         record = records.get(key)
         if record is None:
@@ -193,7 +238,15 @@ def _build_from_unaligned_raw(participant_dir: Path, records: dict, kind: str,
         for span in spans:
             output.append(_pair(record, kind, full_text, tokens, span, raw_path,
                                 "unverified_psychopy_to_eeg_offset", unaligned_clock_offset_seconds))
-    return output
+            if kind == "question":
+                pair = _pair(record, kind, full_text, tokens, span, raw_path,
+                             "unverified_psychopy_to_eeg_offset", unaligned_clock_offset_seconds,
+                             target_type="response")
+                if pair is not None:
+                    query_response_pairs.append(pair)
+                else:
+                    counters["question_spans_missing_displayed_response"] += 1
+    return output, query_response_pairs
 
 
 def build_task_ict_pairs(dataset_dir: Path, output_dir: Path,
@@ -211,56 +264,93 @@ def build_task_ict_pairs(dataset_dir: Path, output_dir: Path,
     counters = defaultdict(int)
     question_pairs = []
     response_pairs = []
+    query_response_pairs = []
     for participant_dir in sorted(path for path in dataset_dir.glob("P*") if path.is_dir()):
         participant = participant_dir.name
         for session_dir in sorted(participant_dir.glob("ses-*")):
             question_path = session_dir / f"{participant}_reading-epo.fif"
             response_path = session_dir / f"{participant}_response_fixations-epo.fif"
             if question_path.is_file():
-                question_pairs.extend(_build_from_aligned_epochs(
+                question_results, query_response_results = _build_from_aligned_epochs(
                     question_path, participant, session_dir.name, records, "question", random_seed,
-                    query_ratio, min_query_length, max_query_length, pairs_per_trial, min_fixations, counters))
+                    query_ratio, min_query_length, max_query_length, pairs_per_trial, min_fixations, counters)
+                question_pairs.extend(question_results)
+                query_response_pairs.extend(query_response_results)
             if response_path.is_file():
-                response_pairs.extend(_build_from_aligned_epochs(
+                response_results, _ = _build_from_aligned_epochs(
                     response_path, participant, session_dir.name, records, "response", random_seed,
-                    query_ratio, min_query_length, max_query_length, pairs_per_trial, min_fixations, counters))
-        question_pairs.extend(_build_from_unaligned_raw(
+                    query_ratio, min_query_length, max_query_length, pairs_per_trial, min_fixations, counters)
+                response_pairs.extend(response_results)
+        question_results, query_response_results = _build_from_unaligned_raw(
             participant_dir, records, "question", unaligned_clock_offset_seconds, random_seed,
-            query_ratio, min_query_length, max_query_length, pairs_per_trial, min_fixations, counters))
-        response_pairs.extend(_build_from_unaligned_raw(
+            query_ratio, min_query_length, max_query_length, pairs_per_trial, min_fixations, counters)
+        question_pairs.extend(question_results)
+        query_response_pairs.extend(query_response_results)
+        response_results, _ = _build_from_unaligned_raw(
             participant_dir, records, "response", unaligned_clock_offset_seconds, random_seed,
-            query_ratio, min_query_length, max_query_length, pairs_per_trial, min_fixations, counters))
+            query_ratio, min_query_length, max_query_length, pairs_per_trial, min_fixations, counters)
+        response_pairs.extend(response_results)
 
-    if not question_pairs or not response_pairs:
-        raise ValueError(f"Both ICT types need usable pairs; question={len(question_pairs)}, response={len(response_pairs)}")
+    if not question_pairs or not response_pairs or not query_response_pairs:
+        raise ValueError("All three Task pair types need usable pairs; "
+                         f"question_ict={len(question_pairs)}, response_ict={len(response_pairs)}, "
+                         f"query_response={len(query_response_pairs)}")
 
-    combined_pairs = question_pairs + response_pairs
+    combined_pairs = query_response_pairs + question_pairs + response_pairs
     base_metadata = {
         "dataset_name": "authentic_query_ict",
-        "version": "authentic_query_question_and_response_ict_v1",
+        "version": "authentic_query_question_response_and_query_response_ict_v3",
         "supports_runtime_masking": True,
         "training_source": "authentic_query",
         "query_pair_definitions": {
             "authentic_question_ict": "question-span EEG to full question text",
             "authentic_response_ict": "displayed-response-span EEG to full response_seen text",
+            "authentic_query_response": "question-span EEG to the same trial's full displayed response_seen text",
         },
-        "response_target_note": "Response ICT uses the edited response actually displayed to the participant, not the gold answer.",
+        "response_target_note": "Response ICT and question-to-response pairs use the exact response displayed to the participant, not the gold answer.",
         "sampling": {"random_seed": random_seed, "query_ratio": query_ratio,
                      "min_query_length": min_query_length, "max_query_length": max_query_length,
                      "pairs_per_trial_per_kind": pairs_per_trial, "min_fixations_in_span": min_fixations},
         "unaligned_policy": "P001/P002 use explicit unverified PsychoPy-to-EEG zero-offset assumption and remain labeled unverified.",
         "unaligned_clock_offset_seconds": unaligned_clock_offset_seconds,
         "p001_p002_identity_warning": "Their source files are byte-identical and independent identity is unverified.",
-        "counts": {"question_ict": len(question_pairs), "response_ict": len(response_pairs),
+        "counts": {"query_response": len(query_response_pairs),
+               "question_ict": len(question_pairs), "response_ict": len(response_pairs),
                    "combined": len(combined_pairs)},
         "counters": dict(counters),
         "created_utc": datetime.now(timezone.utc).isoformat(),
     }
     output_dir.mkdir(parents=True, exist_ok=True)
+    aligned_query_response = [pair for pair in query_response_pairs
+                              if pair["alignment_status"] == "aligned_word_index"]
+    aligned_question_ict = [pair for pair in question_pairs
+                            if pair["alignment_status"] == "aligned_word_index"]
+    aligned_response_ict = [pair for pair in response_pairs
+                            if pair["alignment_status"] == "aligned_word_index"]
+    aligned_combined = aligned_query_response + aligned_question_ict + aligned_response_ict
+    aligned_metadata = {
+        **base_metadata,
+        "dataset_name": "authentic_task_ict_aligned",
+        "alignment_filter": "Only aligned_word_index EEG; unverified clock-offset pairs excluded.",
+        "counts": {
+            "query_response": len(aligned_query_response),
+            "question_ict": len(aligned_question_ict),
+            "response_ict": len(aligned_response_ict),
+            "combined": len(aligned_combined),
+        },
+    }
     outputs = {
+        "authentic_query_response_pairs.npy": (query_response_pairs, {**base_metadata, "dataset_name": "authentic_query_response"}),
         "authentic_question_ict_pairs.npy": (question_pairs, {**base_metadata, "dataset_name": "authentic_question_ict"}),
         "authentic_response_ict_pairs.npy": (response_pairs, {**base_metadata, "dataset_name": "authentic_response_ict"}),
         "authentic_task_ict_pairs.npy": (combined_pairs, base_metadata),
+        "authentic_query_response_aligned_pairs.npy": (
+            aligned_query_response, {**aligned_metadata, "dataset_name": "authentic_query_response_aligned"}),
+        "authentic_question_ict_aligned_pairs.npy": (
+            aligned_question_ict, {**aligned_metadata, "dataset_name": "authentic_question_ict_aligned"}),
+        "authentic_response_ict_aligned_pairs.npy": (
+            aligned_response_ict, {**aligned_metadata, "dataset_name": "authentic_response_ict_aligned"}),
+        "authentic_task_ict_aligned_pairs.npy": (aligned_combined, aligned_metadata),
     }
     for name, (pairs, metadata) in outputs.items():
         np.save(output_dir / name, {"ict_pairs": pairs, "metadata": metadata}, allow_pickle=True)

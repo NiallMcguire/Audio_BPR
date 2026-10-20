@@ -12,40 +12,44 @@ from pathlib import Path
 
 AUDIO_BPR_DIR = Path(__file__).resolve().parent
 EXPERIMENTS = (
-    ("task_only", ("task",)),
-    ("audio_only", ("audio",)),
-    ("visual_only", ("visual",)),
-    ("audio_visual", ("audio", "visual")),
-    ("audio_task", ("audio", "task")),
-    ("visual_task", ("visual", "task")),
-    ("audio_visual_task", ("audio", "visual", "task")),
+    ("query_response_only", ("query_response",)),
+    ("query_response_plus_question_ict", ("query_response", "question_ict")),
+    ("query_response_plus_response_ict", ("query_response", "response_ict")),
+    ("all_task_sources", ("query_response", "question_ict", "response_ict")),
+    ("all_task_sources_audio", ("query_response", "question_ict", "response_ict", "audio")),
+    ("all_task_sources_visual", ("query_response", "question_ict", "response_ict", "visual")),
+    ("all_task_sources_audio_visual",
+     ("query_response", "question_ict", "response_ict", "audio", "visual")),
 )
 
 
 def build_plan(audio_data: Path, visual_data: Path, task_data: Path,
-               experiment_names: list[str] | tuple[str, ...] | None = None,
-               include_task_target_holdout: bool = False) -> list[dict]:
-    sources = {"audio": str(audio_data.resolve()), "visual": str(visual_data.resolve()),
-               "task": str(task_data.resolve())}
+               experiment_names: list[str] | tuple[str, ...] | None = None) -> list[dict]:
+    task_dir = Path(task_data).resolve().parent
+    sources = {
+        "audio": str(Path(audio_data).resolve()),
+        "visual": str(Path(visual_data).resolve()),
+        "query_response": str(task_dir / "authentic_query_response_aligned_pairs.npy"),
+        "question_ict": str(task_dir / "authentic_question_ict_aligned_pairs.npy"),
+        "response_ict": str(task_dir / "authentic_response_ict_aligned_pairs.npy"),
+    }
     selected_names = set(experiment_names) if experiment_names is not None else None
     plan = []
     for name, source_names in EXPERIMENTS:
         if selected_names is not None and name not in selected_names:
             continue
-        plan.append({"name": name, "sources": list(source_names), "split_strategy": "pair",
+        plan.append({"name": name, "sources": list(source_names), "split_strategy": "target",
+                 "primary_eval_source": "authentic_query_response",
                      "data_paths": [sources[source] for source in source_names]})
     if selected_names is not None and {row["name"] for row in plan} != selected_names:
         raise ValueError(f"Unknown experiment names: {sorted(selected_names - {row['name'] for row in plan})}")
-    if include_task_target_holdout:
-        plan.append({"name": "task_only_target_holdout", "sources": ["task"],
-                     "data_paths": [sources["task"]], "split_strategy": "target"})
     return plan
 
 
 def _controller_command(experiment: dict, output_path: Path, python_executable: str,
                         seed: int, epochs: int, patience: int, batch_size: int, learning_rate: float,
                         use_pretrained_text: bool, use_lora: bool,
-                        pooling_strategy: str) -> list[str]:
+                        pooling_strategy: str, wandb_project: str) -> list[str]:
     command = [python_executable, str(AUDIO_BPR_DIR / "controller.py")]
     paths = experiment["data_paths"]
     if len(paths) == 1:
@@ -67,6 +71,11 @@ def _controller_command(experiment: dict, output_path: Path, python_executable: 
         "--validation_masking_levels", "0", "25", "50", "75", "90", "100",
         "--primary_masking_level", "90",
         "--output_dir", str(output_path),
+        "--experiment-name", experiment["name"],
+        "--ablation-sources", *experiment["sources"],
+        "--primary-eval-source", experiment["primary_eval_source"],
+        "--wandb-project", wandb_project,
+        "--wandb-run-name", f"aqbpr_{experiment['name']}_mean_seed{seed}",
     ])
     if len(paths) > 1 or "task" in experiment["sources"]:
         command.append("--balance_sources")
@@ -105,15 +114,22 @@ def _slurm_script(experiment: dict, command: list[str], output_dir: Path, partit
 
 
 def prepare_jobs(audio_data: Path, visual_data: Path, task_data: Path, output_dir: Path,
-                 partition: str = "gpu", time_limit: str = "12:00:00", memory: str = "64G",
-                 cpus: int = 8, gpu_request: str = "gpu:1", python_executable: str = sys.executable,
+                 partition: str = "gpu", time_limit: str = "24:00:00", memory: str = "128G",
+                 cpus: int = 12, gpu_request: str = "gpu:1", python_executable: str = sys.executable,
                  seed: int = 42, epochs: int = 200, batch_size: int = 32,
                  patience: int = 10, experiment_names: list[str] | tuple[str, ...] | None = None,
                  learning_rate: float = 1e-5, use_pretrained_text: bool = True,
                  use_lora: bool = False, pooling_strategy: str = "mean", validate_inputs: bool = False,
                  overwrite: bool = False, exclude_nodes: list[str] | None = None,
-                 include_task_target_holdout: bool = False) -> dict:
-    inputs = {"audio": Path(audio_data), "visual": Path(visual_data), "task": Path(task_data)}
+                 wandb_project: str = "Authentic Queries BPR") -> dict:
+    task_dir = Path(task_data).resolve().parent
+    inputs = {
+        "audio": Path(audio_data), "visual": Path(visual_data),
+        "task_union": Path(task_data),
+        "query_response": task_dir / "authentic_query_response_aligned_pairs.npy",
+        "question_ict": task_dir / "authentic_question_ict_aligned_pairs.npy",
+        "response_ict": task_dir / "authentic_response_ict_aligned_pairs.npy",
+    }
     if validate_inputs:
         missing = [f"{name}: {path}" for name, path in inputs.items() if not path.is_file()]
         if missing:
@@ -122,8 +138,7 @@ def prepare_jobs(audio_data: Path, visual_data: Path, task_data: Path, output_di
     output_dir = Path(output_dir).resolve()
     jobs_dir = output_dir / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
-    plan = build_plan(inputs["audio"], inputs["visual"], inputs["task"], experiment_names,
-                      include_task_target_holdout)
+    plan = build_plan(inputs["audio"], inputs["visual"], inputs["task_union"], experiment_names)
     if not plan:
         raise ValueError("Select at least one experiment")
     plan_path = output_dir / "experiment_matrix.json"
@@ -134,28 +149,32 @@ def prepare_jobs(audio_data: Path, visual_data: Path, task_data: Path, output_di
         experiment_output = output_dir / "results" / experiment["name"]
         command = _controller_command(experiment, experiment_output, python_executable, seed,
                           epochs, patience, batch_size, learning_rate, use_pretrained_text, use_lora,
-                                      pooling_strategy)
+                          pooling_strategy, wandb_project)
         script_path = jobs_dir / f"{experiment['name']}.sbatch"
         script_path.write_text(_slurm_script(experiment, command, output_dir, partition,
                                              time_limit, memory, cpus, gpu_request, exclude_nodes), encoding="utf-8")
         script_path.chmod(0o755)
         experiment["job_script"] = str(script_path)
         experiment["output_dir"] = str(experiment_output)
-        experiment["balance_sources"] = len(experiment["sources"]) > 1 or "task" in experiment["sources"]
+        experiment["balance_sources"] = len(experiment["sources"]) > 1
+        experiment["task_pair_sources"] = [source for source in experiment["sources"]
+                            if source in {"query_response", "question_ict", "response_ict"}]
 
     report = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "submitted": False,
-        "split_policy": "deterministic, source-stratified pair-level 80/10/10; optional Task target-grouped diagnostic",
-        "training_policy": "equal-probability source sampling for mixed-source conditions",
+        "split_policy": "deterministic 80/10/10 grouped by normalized Task question text across participants; same seed across conditions",
+        "training_policy": "equal-probability modality/source sampling; Task subtypes balanced within the Task modality",
         "multi_positive_all_conditions": True,
+        "query_group_multi_positive": "same question-span EEG with both full-question and displayed-response targets are positives",
         "pooling_strategy": pooling_strategy,
+        "wandb_project": wandb_project,
         "excluded_nodes": exclude_nodes or [],
         "patience": patience,
         "text_encoder_policy": "pretrained ColBERT frozen (LoRA disabled)" if use_pretrained_text and not use_lora
         else "pretrained ColBERT with LoRA" if use_pretrained_text else "text encoder trained from scratch",
-        "evaluation_policy": "each source's held-out queries ranked against only that source's held-out candidate passages",
-        "unaligned_task_policy": "P001/P002 task EEG uses the configured zero-offset assumption and is flagged unverified in the pair metadata",
+        "evaluation_policy": "source-specific held-out candidate pools; primary comparison is authentic_query_response",
+        "primary_alignment_policy": "Primary jobs use only aligned_word_index Task EEG; unverified P001/P002 offset pairs remain in full files for separate sensitivity analysis.",
         "resources": {"partition": partition, "time": time_limit, "memory": memory,
                       "cpus_per_task": cpus, "gres": gpu_request},
         "matrix": plan,
@@ -175,12 +194,13 @@ def main() -> None:
     parser.add_argument("--audio-data", type=Path, required=True)
     parser.add_argument("--visual-data", type=Path, required=True)
     parser.add_argument("--task-data", type=Path,
-                        default=AUDIO_BPR_DIR.parent / "dataset" / "authentic_query_task_pairs.npy")
+                        default=AUDIO_BPR_DIR.parent / "dataset" / "authentic_task_ict_query_response"
+                        / "authentic_task_ict_aligned_pairs.npy")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--partition", default="gpu")
-    parser.add_argument("--time", default="12:00:00")
-    parser.add_argument("--memory", default="64G")
-    parser.add_argument("--cpus", type=int, default=8)
+    parser.add_argument("--time", default="24:00:00")
+    parser.add_argument("--memory", default="128G")
+    parser.add_argument("--cpus", type=int, default=12)
     parser.add_argument("--gpu-request", default="gpu:1")
     parser.add_argument("--exclude-nodes", nargs="+", default=None,
                         help="Slurm nodes to avoid, e.g. gpu04")
@@ -190,8 +210,7 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--experiments", nargs="+", choices=[name for name, _ in EXPERIMENTS],
                         default=None, help="Subset of experiment conditions to prepare")
-    parser.add_argument("--include-task-target-holdout", action="store_true",
-                        help="Add a Task-only target-grouped leakage diagnostic")
+    parser.add_argument("--wandb-project", default="Authentic Queries BPR")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--pooling-strategy", choices=("cls", "mean", "max", "multi"), default="mean")
@@ -210,7 +229,7 @@ def main() -> None:
         learning_rate=args.learning_rate, use_pretrained_text=not args.no_pretrained_text,
         use_lora=args.use_lora, pooling_strategy=args.pooling_strategy, validate_inputs=args.validate_inputs,
         overwrite=args.overwrite, exclude_nodes=args.exclude_nodes,
-        include_task_target_holdout=args.include_task_target_holdout,
+        wandb_project=args.wandb_project,
     )
     print(f"Prepared {len(report['matrix'])} Slurm job scripts; no jobs submitted.")
     print(f"Plan: {Path(args.output_dir).resolve() / 'experiment_matrix.json'}")

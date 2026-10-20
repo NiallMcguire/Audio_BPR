@@ -423,22 +423,16 @@ class DynamicMaskingDataloader(Dataset):
             grouped.setdefault(training_source, {}).setdefault(str(group_id), []).append(index)
 
         selected = []
+        train_cutoff = train_ratio
+        val_cutoff = train_ratio + (1.0 - train_ratio) / 2.0
         for source in sorted(grouped):
-            group_ids = sorted(grouped[source])
-            digest = hashlib.sha256(f"{seed}:{source}:target".encode('utf-8')).digest()
-            source_seed = int.from_bytes(digest[:8], byteorder='big')
-            random.Random(source_seed).shuffle(group_ids)
-            train_end = int(len(group_ids) * train_ratio)
-            val_size = int(len(group_ids) * (1.0 - train_ratio) / 2.0)
-            val_end = min(train_end + val_size, len(group_ids))
-            if split == 'train':
-                chosen = group_ids[:train_end]
-            elif split == 'val':
-                chosen = group_ids[train_end:val_end]
-            else:
-                chosen = group_ids[val_end:]
-            for group_id in chosen:
-                selected.extend(grouped[source][group_id])
+            for group_id, indices in grouped[source].items():
+                digest = hashlib.sha256(f"{seed}:{source}:target:{group_id}".encode('utf-8')).digest()
+                assignment = int.from_bytes(digest[:8], byteorder='big') / 2**64
+                if ((split == 'train' and assignment < train_cutoff)
+                        or (split == 'val' and train_cutoff <= assignment < val_cutoff)
+                        or (split == 'test' and assignment >= val_cutoff)):
+                    selected.extend(indices)
 
         participants = {self.ict_pairs[index].get('participant_id', 'unknown') for index in selected}
         return selected, participants
@@ -650,6 +644,7 @@ class DynamicMaskingDataloader(Dataset):
             'is_masked': pair.get('is_masked', False),
             'dataset_source': dataset_source,
             'document_id': document_id,
+            'query_group_id': pair.get('query_group_id', ''),
             'training_source': pair.get('training_source', pair.get('dataset_source', self.metadata.get('version', 'unknown'))),
             'query_kind': pair.get('query_kind', ''),
             'split_group_id': pair.get('split_group_id', ''),
@@ -862,6 +857,7 @@ class DynamicMaskingDataloader(Dataset):
                 'current_masking_probability': self._current_masking_probability,  # NEW
                 'dataset_source': sample['dataset_source'],
                 'document_id': sample['document_id'],
+                'query_group_id': sample.get('query_group_id', ''),
                 'training_source': sample.get('training_source', sample['dataset_source']),
                 'query_kind': sample.get('query_kind', ''),
                 'split_group_id': sample.get('split_group_id', ''),
