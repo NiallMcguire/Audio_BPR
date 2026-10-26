@@ -271,10 +271,10 @@ class DynamicMaskingDataloader(Dataset):
         self.fold = fold  # NEW: Store fold number
         self.pair_split_seed = pair_split_seed
         self.split_strategy = split_strategy
-        if split_strategy not in {'pair', 'target'}:
-            raise ValueError(f"split_strategy must be 'pair' or 'target', got {split_strategy}")
-        if holdout_subjects and split_strategy == 'target':
-            raise ValueError("target split cannot be combined with holdout_subjects")
+        if split_strategy not in {'pair', 'target', 'trial', 'original'}:
+            raise ValueError(f"split_strategy must be 'pair', 'target', 'trial', or 'original', got {split_strategy}")
+        if holdout_subjects and split_strategy != 'pair':
+            raise ValueError(f"{split_strategy} split cannot be combined with holdout_subjects")
 
         # DYNAMIC: Store masking probability as mutable attribute
         self._current_masking_probability = initial_masking_probability
@@ -344,6 +344,14 @@ class DynamicMaskingDataloader(Dataset):
             if self.debug:
                 print("Using deterministic target-grouped split")
             self.indices, self.unique_subjects = self._create_target_split(split, train_ratio, pair_split_seed)
+        elif split_strategy == 'trial':
+            if self.debug:
+                print("Using trial-grouped Task split; other sources use pair-level split")
+            self.indices, self.unique_subjects = self._create_trial_split(split, train_ratio, pair_split_seed)
+        elif split_strategy == 'original':
+            if self.debug:
+                print("Using original Audio BPR random sample split")
+            self.indices, self.unique_subjects = self._create_original_random_split(split, train_ratio)
         else:
             # Deterministic pair-level split within each source. This preserves
             # the same source test pairs when other datasets are added/removed.
@@ -376,14 +384,17 @@ class DynamicMaskingDataloader(Dataset):
         old_probability = self._current_masking_probability
         self._current_masking_probability = new_probability
 
-    def _create_pair_split(self, split, train_ratio, seed):
+    def _create_pair_split(self, split, train_ratio, seed, candidate_indices=None):
         if split not in {'train', 'val', 'test'}:
             raise ValueError(f"Split must be 'train', 'val', or 'test', got {split}")
         if not 0.0 < train_ratio < 1.0:
             raise ValueError(f"train_ratio must be between 0 and 1, got {train_ratio}")
 
+        if candidate_indices is None:
+            candidate_indices = range(len(self.ict_pairs))
         by_source = {}
-        for index, pair in enumerate(self.ict_pairs):
+        for index in candidate_indices:
+            pair = self.ict_pairs[index]
             by_source.setdefault(pair.get('dataset_source', 'unknown'), []).append(index)
 
         selected = []
@@ -402,6 +413,49 @@ class DynamicMaskingDataloader(Dataset):
             else:
                 selected.extend(indices[val_end:])
 
+        participants = {self.ict_pairs[index].get('participant_id', 'unknown') for index in selected}
+        return selected, participants
+
+    def _create_original_random_split(self, split, train_ratio):
+        """Exact original Audio BPR split: val is the 20% remainder, test is its second half."""
+        if split not in {'train', 'val', 'test'}:
+            raise ValueError(f"Split must be 'train', 'val', or 'test', got {split}")
+        random.seed(42)
+        shuffled_indices = list(range(len(self.ict_pairs)))
+        random.shuffle(shuffled_indices)
+        split_idx = int(len(self.ict_pairs) * train_ratio)
+        if split == 'train':
+            selected = shuffled_indices[:split_idx]
+        elif split == 'val':
+            selected = shuffled_indices[split_idx:]
+        else:
+            val_indices = shuffled_indices[split_idx:]
+            selected = val_indices[len(val_indices) // 2:]
+        participants = {self.ict_pairs[index].get('participant_id', 'unknown') for index in selected}
+        return selected, participants
+
+    def _create_trial_split(self, split, train_ratio, seed):
+        """Hash Task trials into splits; sources without trial groups keep the pair-level split."""
+        if split not in {'train', 'val', 'test'}:
+            raise ValueError(f"Split must be 'train', 'val', or 'test', got {split}")
+        train_cutoff = train_ratio
+        val_cutoff = train_ratio + (1.0 - train_ratio) / 2.0
+        selected = []
+        ungrouped = []
+        for index, pair in enumerate(self.ict_pairs):
+            group_id = pair.get('split_group_id')
+            if not group_id:
+                ungrouped.append(index)
+                continue
+            source = pair.get('training_source', pair.get('dataset_source', 'unknown'))
+            digest = hashlib.sha256(f"{seed}:{source}:trial:{group_id}".encode('utf-8')).digest()
+            assignment = int.from_bytes(digest[:8], byteorder='big') / 2**64
+            if ((split == 'train' and assignment < train_cutoff)
+                    or (split == 'val' and train_cutoff <= assignment < val_cutoff)
+                    or (split == 'test' and assignment >= val_cutoff)):
+                selected.append(index)
+        if ungrouped:
+            selected.extend(self._create_pair_split(split, train_ratio, seed, ungrouped)[0])
         participants = {self.ict_pairs[index].get('participant_id', 'unknown') for index in selected}
         return selected, participants
 
@@ -458,16 +512,27 @@ class DynamicMaskingDataloader(Dataset):
             tuple: (selected_indices, unique_subjects_in_split)
         """
 
-        # Extract all unique participants
-        participant_to_indices = {}
+        by_source = {}
         for idx, pair in enumerate(self.ict_pairs):
-            participant_id = pair.get('participant_id', 'unknown')
-            if participant_id not in participant_to_indices:
-                participant_to_indices[participant_id] = []
-            participant_to_indices[participant_id].append(idx)
+            source = pair.get('training_source', pair.get('dataset_source', 'unknown'))
+            by_source.setdefault(source, {}).setdefault(pair.get('participant_id', 'unknown'), []).append(idx)
 
+        selected_indices = []
+        selected_participants = set()
+        for source, participant_to_indices in by_source.items():
+            if debug:
+                print(f"Participant split for source {source}:")
+            indices, participants = self._split_source_participants(
+                participant_to_indices, split, debug, fold)
+            selected_indices.extend(indices)
+            selected_participants.update(participants)
+        return selected_indices, selected_participants
+
+    def _split_source_participants(self, participant_to_indices, split, debug, fold=None):
         unique_participants = list(participant_to_indices.keys())
-        random.shuffle(unique_participants)  # Ensures reproducible but random ordering
+        # Original Audio BPR protocol: reseed before every split so train/val/test agree.
+        random.seed(42)
+        random.shuffle(unique_participants)
 
         if debug:
             print(f"Found {len(unique_participants)} unique participants")
@@ -628,6 +693,9 @@ class DynamicMaskingDataloader(Dataset):
         eeg_processed = self._process_eeg(query_eeg)
         if eeg_processed is None:
             return None
+        # Keep only the occupied block; padding is rebuilt per sample to save host RAM.
+        occupied = np.flatnonzero(np.abs(eeg_processed).reshape(eeg_processed.shape[0], -1).max(axis=1) > 0)
+        eeg_processed = eeg_processed[:occupied[-1] + 1].copy() if occupied.size else eeg_processed[:1].copy()
 
         dataset_source = pair.get('dataset_source', self.metadata.get('version', 'unknown'))
         document_id = pair.get('document_id')
@@ -656,6 +724,8 @@ class DynamicMaskingDataloader(Dataset):
             'full_sentence_words': full_sentence_words,
             'supports_runtime_masking': pair_supports_masking,
             'question_id': pair.get('question_id', ''),
+            'question_document_id': pair.get('question_document_id', ''),
+            'positive_document_ids': list(pair.get('positive_document_ids') or [document_id]),
             'session_id': pair.get('session_id', ''),
             'part': pair.get('part', ''),
             'trial': pair.get('trial', ''),
@@ -830,7 +900,10 @@ class DynamicMaskingDataloader(Dataset):
         doc_tokens = self._tokenize_text(doc_text, is_query=False)
 
         # Process EEG
-        eeg_tensor = torch.tensor(sample['query_eeg'], dtype=torch.float32)
+        eeg_compact = sample['query_eeg']
+        eeg_full = np.zeros((self.global_max_words, self.global_max_time, self.global_max_channels), dtype=np.float32)
+        eeg_full[:eeg_compact.shape[0]] = eeg_compact
+        eeg_tensor = torch.from_numpy(eeg_full)
         eeg_tensor = self._normalize_eeg(eeg_tensor)
 
         # Multi-vector mask
@@ -862,6 +935,8 @@ class DynamicMaskingDataloader(Dataset):
                 'query_kind': sample.get('query_kind', ''),
                 'split_group_id': sample.get('split_group_id', ''),
                 'question_id': sample.get('question_id', ''),
+                'question_document_id': sample.get('question_document_id', ''),
+                'positive_document_ids': sample.get('positive_document_ids', [sample['document_id']]),
                 'session_id': sample.get('session_id', ''),
                 'part': sample.get('part', ''),
                 'trial': sample.get('trial', ''),

@@ -69,6 +69,7 @@ def _pair(record: dict[str, str], kind: str, full_text: str, tokens: list[str],
     doc_words = tokens
     pair_source = "authentic_question_ict" if kind == "question" else "authentic_response_ict"
     supports_runtime_masking = True
+    question_document_id = _task_document_id(record["question_text"])
     document_id = None
     if kind == "question":
         query_group_parts = (record["participant_id"], record["session_id"], record["part"],
@@ -76,8 +77,8 @@ def _pair(record: dict[str, str], kind: str, full_text: str, tokens: list[str],
         query_group_id = hashlib.sha256("\0".join(map(str, query_group_parts)).encode("utf-8")).hexdigest()
     else:
         query_group_id = ""
-    normalized_question = " ".join(record["question_text"].split()).casefold()
-    split_group_id = "task_query:" + hashlib.sha256(normalized_question.encode("utf-8")).hexdigest()
+    split_group_id = "task_trial:" + "|".join(
+        str(record[field]) for field in ("participant_id", "session_id", "part", "trial", "question_id"))
 
     if kind == "question" and target_type == "response":
         doc_text = record["response_seen"].strip()
@@ -86,13 +87,13 @@ def _pair(record: dict[str, str], kind: str, full_text: str, tokens: list[str],
         doc_words = doc_text.split()
         pair_source = "authentic_query_response"
         supports_runtime_masking = False
-        normalized_response = " ".join(doc_text.split()).casefold()
-        response_hash = hashlib.sha256(normalized_response.encode("utf-8")).hexdigest()
-        document_id = f"authentic_task_response:{response_hash}"
-    elif kind == "response":
-        normalized_response = " ".join(doc_text.split()).casefold()
-        response_hash = hashlib.sha256(normalized_response.encode("utf-8")).hexdigest()
-        document_id = f"authentic_task_response:{response_hash}"
+    document_id = _task_document_id(doc_text)
+    response_document_id = _task_document_id(record["response_seen"]) if record["response_seen"].strip() else ""
+    # Question-reading EEG is relevant to both the question it read and the response it led to.
+    if kind == "question":
+        positive_document_ids = [question_document_id] + ([response_document_id] if response_document_id else [])
+    else:
+        positive_document_ids = [document_id]
 
     eeg_sequence = np.asarray([np.asarray(eeg, dtype=np.float32).T for eeg in eeg_rows], dtype=np.float32)
     pair = {
@@ -112,6 +113,9 @@ def _pair(record: dict[str, str], kind: str, full_text: str, tokens: list[str],
         "trial": int(record["trial"]),
         "sentence_id": int(record["trial"]),
         "question_id": record["question_id"],
+        "question_document_id": question_document_id,
+        "question_text": record["question_text"],
+        "positive_document_ids": positive_document_ids,
         "split_group_id": split_group_id,
         "query_group_id": query_group_id,
         "query_kind": "question_to_response" if pair_source == "authentic_query_response" else kind,
@@ -129,9 +133,29 @@ def _pair(record: dict[str, str], kind: str, full_text: str, tokens: list[str],
         "source_identity_group": "P001_P002_byte_identical" if record["participant_id"] in {"P001", "P002"} else "",
         "source_eeg_file": str(source_path),
     }
-    if document_id is not None:
-        pair["document_id"] = document_id
+    pair["document_id"] = document_id
     return pair
+
+
+def _full_query_response_pair(record: dict[str, str], tokens: list[str],
+                              events: list[tuple[int, np.ndarray, float]], source_path: Path,
+                              alignment_status: str, offset_seconds: float | None,
+                              min_fixations: int, counters: defaultdict) -> dict | None:
+    if len(events) < min_fixations:
+        counters["question_trials_without_full_query_fixations"] += 1
+        return None
+    eeg_rows = [eeg for _, eeg, _ in sorted(events, key=lambda event: event[2])]
+    pair = _pair(record, "question", record["question_text"], tokens, (0, len(tokens), eeg_rows),
+                 source_path, alignment_status, offset_seconds, target_type="response")
+    if pair is None:
+        counters["question_trials_missing_displayed_response"] += 1
+    return pair
+
+
+def _task_document_id(text: str) -> str:
+    normalized = " ".join(text.split()).casefold()
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"authentic_task_text:{digest}"
 
 
 def _build_from_aligned_epochs(epochs_path: Path, participant: str, session: str,
@@ -150,7 +174,6 @@ def _build_from_aligned_epochs(epochs_path: Path, participant: str, session: str
         grouped[key].append((row, data[event_index]))
 
     output = []
-    query_response_pairs = []
     query_response_pairs = []
     for key, rows in grouped.items():
         record = records.get(key)
@@ -174,13 +197,11 @@ def _build_from_aligned_epochs(epochs_path: Path, participant: str, session: str
                               counters=counters)
         for span in spans:
             output.append(_pair(record, kind, full_text, tokens, span, epochs_path, "aligned_word_index", None))
-            if kind == "question":
-                pair = _pair(record, kind, full_text, tokens, span, epochs_path,
-                             "aligned_word_index", None, target_type="response")
-                if pair is not None:
-                    query_response_pairs.append(pair)
-                else:
-                    counters["question_spans_missing_displayed_response"] += 1
+        if kind == "question":
+            pair = _full_query_response_pair(record, tokens, events, epochs_path, "aligned_word_index",
+                                             None, min_fixations, counters)
+            if pair is not None:
+                query_response_pairs.append(pair)
     return output, query_response_pairs
 
 
@@ -238,14 +259,12 @@ def _build_from_unaligned_raw(participant_dir: Path, records: dict, kind: str,
         for span in spans:
             output.append(_pair(record, kind, full_text, tokens, span, raw_path,
                                 "unverified_psychopy_to_eeg_offset", unaligned_clock_offset_seconds))
-            if kind == "question":
-                pair = _pair(record, kind, full_text, tokens, span, raw_path,
-                             "unverified_psychopy_to_eeg_offset", unaligned_clock_offset_seconds,
-                             target_type="response")
-                if pair is not None:
-                    query_response_pairs.append(pair)
-                else:
-                    counters["question_spans_missing_displayed_response"] += 1
+        if kind == "question":
+            pair = _full_query_response_pair(record, tokens, events, raw_path,
+                                             "unverified_psychopy_to_eeg_offset",
+                                             unaligned_clock_offset_seconds, min_fixations, counters)
+            if pair is not None:
+                query_response_pairs.append(pair)
     return output, query_response_pairs
 
 
@@ -299,14 +318,16 @@ def build_task_ict_pairs(dataset_dir: Path, output_dir: Path,
     combined_pairs = query_response_pairs + question_pairs + response_pairs
     base_metadata = {
         "dataset_name": "authentic_query_ict",
-        "version": "authentic_query_question_response_and_query_response_ict_v3",
+        "version": "authentic_query_full_query_response_and_ict_v4",
         "supports_runtime_masking": True,
         "training_source": "authentic_query",
         "query_pair_definitions": {
             "authentic_question_ict": "question-span EEG to full question text",
             "authentic_response_ict": "displayed-response-span EEG to full response_seen text",
-            "authentic_query_response": "question-span EEG to the same trial's full displayed response_seen text",
+            "authentic_query_response": "full-question-reading EEG to the same trial's full displayed response_seen text",
         },
+        "positive_policy": "Question-reading EEG has its full question and response_seen as positives; response-reading EEG has response_seen.",
+        "split_group": "participant/session/part/trial/question; all EEG from one trial stays in one split",
         "response_target_note": "Response ICT and question-to-response pairs use the exact response displayed to the participant, not the gold answer.",
         "sampling": {"random_seed": random_seed, "query_ratio": query_ratio,
                      "min_query_length": min_query_length, "max_query_length": max_query_length,
@@ -352,10 +373,32 @@ def build_task_ict_pairs(dataset_dir: Path, output_dir: Path,
             aligned_response_ict, {**aligned_metadata, "dataset_name": "authentic_response_ict_aligned"}),
         "authentic_task_ict_aligned_pairs.npy": (aligned_combined, aligned_metadata),
     }
+    candidate_documents = {}
+    for pair in aligned_combined:
+        for document_type, text in (("question", pair["question_text"]), ("response", pair["response_seen"])):
+            if not text.strip():
+                continue
+            document_id = _task_document_id(text)
+            candidate = candidate_documents.setdefault(document_id, {
+                "document_id": document_id,
+                "text": text.strip(),
+                "document_types": [],
+            })
+            if document_type not in candidate["document_types"]:
+                candidate["document_types"].append(document_type)
+
     for name, (pairs, metadata) in outputs.items():
         np.save(output_dir / name, {"ict_pairs": pairs, "metadata": metadata}, allow_pickle=True)
         (output_dir / name.replace(".npy", ".manifest.json")).write_text(
             json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    eval_index = {
+        "index_name": "aligned_full_questions_and_displayed_responses",
+        "alignment_filter": "Only aligned_word_index EEG-derived Task text; one row per unique normalized full-text document.",
+        "candidate_count": len(candidate_documents),
+        "candidate_documents": list(candidate_documents.values()),
+    }
+    (output_dir / "authentic_task_expanded_eval_index.json").write_text(
+        json.dumps(eval_index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return base_metadata
 
 

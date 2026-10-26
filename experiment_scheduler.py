@@ -20,26 +20,39 @@ EXPERIMENTS = (
     ("all_task_sources_visual", ("query_response", "question_ict", "response_ict", "visual")),
     ("all_task_sources_audio_visual",
      ("query_response", "question_ict", "response_ict", "audio", "visual")),
+    ("query_response_question_ict_audio", ("query_response", "question_ict", "audio")),
+    ("query_response_question_ict_visual", ("query_response", "question_ict", "visual")),
+    ("query_response_question_ict_audio_visual", ("query_response", "question_ict", "audio", "visual")),
+    *((f"typing_{fmt}{suffix}", (f"typing_{fmt}_query_response", f"typing_{fmt}_ict", *extra))
+      for fmt in ("continuous", "keypress")
+      for suffix, extra in (("", ()), ("_audio", ("audio",)), ("_visual", ("visual",)),
+                            ("_audio_visual", ("audio", "visual")))),
 )
+READING_TASK_SOURCES = {"query_response", "question_ict", "response_ict"}
 
 
 def build_plan(audio_data: Path, visual_data: Path, task_data: Path,
                experiment_names: list[str] | tuple[str, ...] | None = None) -> list[dict]:
     task_dir = Path(task_data).resolve().parent
+    expanded_eval_index = str(task_dir / "authentic_task_expanded_eval_index.json")
     sources = {
         "audio": str(Path(audio_data).resolve()),
         "visual": str(Path(visual_data).resolve()),
         "query_response": str(task_dir / "authentic_query_response_aligned_pairs.npy"),
         "question_ict": str(task_dir / "authentic_question_ict_aligned_pairs.npy"),
         "response_ict": str(task_dir / "authentic_response_ict_aligned_pairs.npy"),
+        **{f"typing_{fmt}_{kind}": str(task_dir.parent / "authentic_typing_pairs"
+                                        / f"authentic_typing_{fmt}_{kind}_pairs.npy")
+           for fmt in ("continuous", "keypress") for kind in ("query_response", "ict")},
     }
     selected_names = set(experiment_names) if experiment_names is not None else None
     plan = []
     for name, source_names in EXPERIMENTS:
         if selected_names is not None and name not in selected_names:
             continue
-        plan.append({"name": name, "sources": list(source_names), "split_strategy": "target",
-                 "primary_eval_source": "authentic_query_response",
+        plan.append({"name": name, "sources": list(source_names), "split_strategy": "original",
+                     "expanded_eval_index": (expanded_eval_index
+                                             if READING_TASK_SOURCES & set(source_names) else None),
                      "data_paths": [sources[source] for source in source_names]})
     if selected_names is not None and {row["name"] for row in plan} != selected_names:
         raise ValueError(f"Unknown experiment names: {sorted(selected_names - {row['name'] for row in plan})}")
@@ -73,13 +86,12 @@ def _controller_command(experiment: dict, output_path: Path, python_executable: 
         "--output_dir", str(output_path),
         "--experiment-name", experiment["name"],
         "--ablation-sources", *experiment["sources"],
-        "--primary-eval-source", experiment["primary_eval_source"],
+        *(["--expanded-eval-index", experiment["expanded_eval_index"]]
+          if experiment["expanded_eval_index"] else []),
         "--wandb-project", wandb_project,
-        "--wandb-run-name", f"aqbpr_{experiment['name']}_mean_seed{seed}",
+        "--wandb-run-name", f"aqbpr_{experiment['name']}_mean_seed{seed}_originalsplit",
+        "--split-strategy", experiment["split_strategy"],
     ])
-    if len(paths) > 1 or "task" in experiment["sources"]:
-        command.append("--balance_sources")
-    command.extend(["--split-strategy", experiment.get("split_strategy", "pair")])
     command.append("--multi-positive-loss")
     if use_pretrained_text:
         command.append("--use_pretrained_text")
@@ -129,11 +141,14 @@ def prepare_jobs(audio_data: Path, visual_data: Path, task_data: Path, output_di
         "query_response": task_dir / "authentic_query_response_aligned_pairs.npy",
         "question_ict": task_dir / "authentic_question_ict_aligned_pairs.npy",
         "response_ict": task_dir / "authentic_response_ict_aligned_pairs.npy",
+        "expanded_eval_index": task_dir / "authentic_task_expanded_eval_index.json",
+        "expanded_eval_index": task_dir / "authentic_task_expanded_eval_index.json",
     }
     if validate_inputs:
         missing = [f"{name}: {path}" for name, path in inputs.items() if not path.is_file()]
         if missing:
             raise FileNotFoundError("Missing data files:\n" + "\n".join(missing))
+    expanded_eval_metadata = json.loads(inputs["expanded_eval_index"].read_text(encoding="utf-8"))
 
     output_dir = Path(output_dir).resolve()
     jobs_dir = output_dir / "jobs"
@@ -141,6 +156,11 @@ def prepare_jobs(audio_data: Path, visual_data: Path, task_data: Path, output_di
     plan = build_plan(inputs["audio"], inputs["visual"], inputs["task_union"], experiment_names)
     if not plan:
         raise ValueError("Select at least one experiment")
+    if validate_inputs:
+        missing = sorted({path for experiment in plan for path in experiment["data_paths"]
+                          if not Path(path).is_file()})
+        if missing:
+            raise FileNotFoundError("Missing experiment data files:\n" + "\n".join(missing))
     plan_path = output_dir / "experiment_matrix.json"
     if not overwrite and plan_path.exists():
         raise FileExistsError(f"{plan_path} exists; pass --overwrite to regenerate prepared jobs")
@@ -156,17 +176,20 @@ def prepare_jobs(audio_data: Path, visual_data: Path, task_data: Path, output_di
         script_path.chmod(0o755)
         experiment["job_script"] = str(script_path)
         experiment["output_dir"] = str(experiment_output)
-        experiment["balance_sources"] = len(experiment["sources"]) > 1
+        experiment["balance_sources"] = True
         experiment["task_pair_sources"] = [source for source in experiment["sources"]
                             if source in {"query_response", "question_ict", "response_ict"}]
 
     report = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "submitted": False,
-        "split_policy": "deterministic 80/10/10 grouped by normalized Task question text across participants; same seed across conditions",
-        "training_policy": "equal-probability modality/source sampling; Task subtypes balanced within the Task modality",
+        "split_policy": "Task: deterministic 80/10/10 by trial (participant/session/part/trial/question), so documents recur across splits but EEG does not; Alice/Nieuwland: existing pair-level split",
+        "training_policy": "each arm trains only on its listed sources (balanced); all three Task sources are always loaded so val/test are identical across arms",
+        "checkpoint_policy": "early stopping on validation loss over all three Task sources",
         "multi_positive_all_conditions": True,
-        "query_group_multi_positive": "same question-span EEG with both full-question and displayed-response targets are positives",
+        "positive_policy": "question-reading EEG (full question or span): its full question and response_seen are positives; response-reading EEG: response_seen",
+        "expanded_eval_policy": "All Task test queries ranked together against one fixed index of all aligned full questions and displayed responses, with per-source breakdown and Gaussian-noise baseline",
+        "expanded_eval_candidate_count": expanded_eval_metadata.get("candidate_count", 0),
         "pooling_strategy": pooling_strategy,
         "wandb_project": wandb_project,
         "excluded_nodes": exclude_nodes or [],

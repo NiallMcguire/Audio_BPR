@@ -19,7 +19,8 @@ from datetime import datetime
 from mv_dataloader import (DynamicMaskingDataloader, simple_collate_fn,
                            compute_combined_eeg_dimensions, load_combined_datasets)
 from mv_models import create_model
-from mv_training import train_model, test_model, finish_wandb
+from mv_training import train_model, test_model, finish_wandb, evaluate_expanded_candidate_index
+import wandb
 
 
 def set_seeds(seed=42):
@@ -65,7 +66,7 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
                        train_ratio, holdout_subjects, training_masking_level,
                        global_eeg_dims=None, combined_dataset=None,
                        pair_split_seed=42, balance_sources=False,
-                       split_strategy='pair'):
+                       split_strategy='pair', train_sources=None):
     """Create training, validation, and test dataloaders"""
 
     # Load each source once. Reopening a very large .npy three times for train,
@@ -93,6 +94,13 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
         initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed,
         split_strategy=split_strategy
     )
+    # Validation and test keep every loaded source so all ablation arms share them.
+    if train_sources:
+        allowed = set(train_sources)
+        train_dataset.processed_pairs = [pair for pair in train_dataset.processed_pairs
+                                         if pair.get('dataset_source') in allowed]
+        if not train_dataset.processed_pairs:
+            raise ValueError(f"No training pairs remain for train_sources={sorted(allowed)}")
 
     val_dataset = DynamicMaskingDataloader(
         data_path=None, combined_dataset=combined_dataset, tokenizer=tokenizer,
@@ -184,13 +192,24 @@ def create_source_test_loaders(test_dataloader):
     }
 
 
+def create_subset_loader(dataloader, keep):
+    dataset = dataloader.dataset
+    local_indices = [index for index, pair in enumerate(dataset.processed_pairs) if keep(pair)]
+    if not local_indices:
+        return None
+    return DataLoader(MaskingAwareSubset(dataset, local_indices), batch_size=dataloader.batch_size,
+                      shuffle=False, collate_fn=simple_collate_fn, num_workers=0)
+
+
 def select_primary_validation_loader(val_dataloader, primary_source=None):
     if primary_source is None:
         return val_dataloader
-    source_loaders = create_source_test_loaders(val_dataloader)
-    if primary_source not in source_loaders:
+    loader = create_subset_loader(
+        val_dataloader,
+        lambda pair: primary_source in (pair.get('dataset_source'), pair.get('training_source')))
+    if loader is None:
         raise ValueError(f"Primary validation source {primary_source!r} is absent from validation data")
-    return source_loaders[primary_source]
+    return loader
 
 
 def save_test_metrics(path, results):
@@ -228,8 +247,10 @@ def main():
                         help='Use subject-based train/val/test split')
     parser.add_argument('--balance_sources', action='store_true',
                         help='Sample mixed-source training pairs with equal source probability')
-    parser.add_argument('--split-strategy', choices=('pair', 'target'), default='pair',
-                        help='Pair-level split or leakage-check split grouped by target')
+    parser.add_argument('--split-strategy', choices=('pair', 'target', 'trial', 'original'), default='pair',
+                        help='Pair-level, target-grouped, Task trial-grouped, or original Audio BPR random split')
+    parser.add_argument('--train-sources', nargs='+', default=None,
+                        help='dataset_source values used for training; val/test keep all loaded sources')
     parser.add_argument('--multi-positive-loss', action='store_true',
                         help='Treat repeated in-batch examples of the same target document as positives')
 
@@ -256,6 +277,8 @@ def main():
                         help='Explicit Weights & Biases run name')
     parser.add_argument('--primary-eval-source', type=str, default=None,
                         help='Source used for validation and early stopping in ablation runs')
+    parser.add_argument('--expanded-eval-index', type=str, default=None,
+                        help='JSON index of full questions and displayed responses for expanded retrieval metrics')
 
     # Additional arguments (with defaults for paper reproduction)
     parser.add_argument('--max_text_len', type=int, default=256, help='Max text sequence length')
@@ -352,13 +375,20 @@ def main():
         combined_dataset=combined_dataset,
         pair_split_seed=args.seed,
         balance_sources=args.balance_sources,
-        split_strategy=args.split_strategy
+        split_strategy=args.split_strategy,
+        train_sources=args.train_sources,
     )
 
     training_val_dataloader = val_dataloader
     if args.primary_eval_source:
         training_val_dataloader = select_primary_validation_loader(val_dataloader, args.primary_eval_source)
         print(f"Early stopping and checkpoint selection use {args.primary_eval_source} only")
+    expanded_eval_index = None
+    if args.expanded_eval_index:
+        with Path(args.expanded_eval_index).open(encoding='utf-8') as stream:
+            expanded_eval_index = json.load(stream)
+        if not expanded_eval_index.get('candidate_documents'):
+            raise ValueError("Expanded evaluation index contains no candidate documents")
 
     # Create experiment configuration
     config = {
@@ -386,6 +416,14 @@ def main():
         'query_group_multi_positive': args.multi_positive_loss,
         'primary_task_source': 'authentic_query_response' if args.experiment_name else None,
         'primary_eval_source': args.primary_eval_source,
+        'train_sources': args.train_sources or [],
+        'expanded_eval_index_path': args.expanded_eval_index,
+        'expanded_eval_candidate_count': (len(expanded_eval_index['candidate_documents'])
+                          if expanded_eval_index else 0),
+        'expanded_eval_policy': (
+            "Full questions and displayed responses form one fixed index; either matching text is relevant."
+            if expanded_eval_index else None
+        ),
         'training_masking_level': args.training_masking_level,
         'enable_multi_masking_validation': args.enable_multi_masking_validation,
         'validation_masking_levels': args.validation_masking_levels,
@@ -463,7 +501,8 @@ def main():
         enable_multi_masking_validation=args.enable_multi_masking_validation,
         multi_masking_frequency=args.multi_masking_frequency,
         validation_masking_levels=args.validation_masking_levels,
-        primary_masking_level=args.primary_masking_level
+        primary_masking_level=args.primary_masking_level,
+        expanded_eval_index=expanded_eval_index,
     )
 
     # Save model with paper-compatible naming
@@ -478,20 +517,42 @@ def main():
 
     # Test evaluation
     if len(test_dataloader.dataset) > 0:
-        print(f"\n=== SOURCE-SPECIFIC TEST EVALUATION ===")
+        print(f"\n=== TEST EVALUATION (original Audio BPR protocol) ===")
         results_dir = output_dir / 'test_by_source'
         results_dir.mkdir(exist_ok=True)
+        test_results = test_model(
+            model=trained_model,
+            test_dataloader=test_dataloader,
+            device=device,
+            test_masking_levels=args.validation_masking_levels,
+            primary_masking_level=args.primary_masking_level,
+        )
+        save_test_metrics(results_dir / 'all_sources_metrics.json', test_results)
         for source, source_loader in create_source_test_loaders(test_dataloader).items():
             print(f"Testing {source} queries against the {source} candidate pool")
-            test_results = test_model(
+            source_results = test_model(
                 model=trained_model,
                 test_dataloader=source_loader,
                 device=device,
                 test_masking_levels=args.validation_masking_levels,
                 primary_masking_level=args.primary_masking_level,
-                wandb_namespace=f'test_by_source/{source}'
+                wandb_namespace=f'test_by_source/{source}',
             )
-            save_test_metrics(results_dir / f'{source}_metrics.json', test_results)
+            save_test_metrics(results_dir / f'{source}_metrics.json', source_results)
+
+        task_test_loader = create_subset_loader(
+            test_dataloader, lambda pair: pair.get('training_source') == 'authentic_query')
+        if expanded_eval_index is not None and task_test_loader is not None:
+            print("Testing all Task queries together against the shared question+response index")
+            combined_results = evaluate_expanded_candidate_index(
+                trained_model, task_test_loader, device, expanded_eval_index,
+                prefix='test_combined_task/index', masking_level=args.primary_masking_level)
+            combined_results.update(evaluate_expanded_candidate_index(
+                trained_model, task_test_loader, device, expanded_eval_index,
+                prefix='test_combined_task/noise', masking_level=args.primary_masking_level,
+                use_noise=True))
+            wandb.log(combined_results)
+            save_test_metrics(results_dir / 'combined_task_index_metrics.json', combined_results)
         print(f"Test evaluation completed; source metrics are in {results_dir}")
 
     finish_wandb()

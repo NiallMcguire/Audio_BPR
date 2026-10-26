@@ -25,8 +25,11 @@ from controller import (create_dataloaders, create_source_test_loaders,
                         select_primary_validation_loader)
 from mv_dataloader import compute_global_eeg_dimensions, load_combined_datasets
 from mv_models import create_model
-from mv_training import (build_document_database, compute_contrastive_loss,
-                         initialize_wandb, perform_ranking_validation, test_model)
+from mv_training import (build_document_database, build_expanded_candidate_database,
+                         compute_contrastive_loss, compute_multi_positive_ranking_metrics,
+                         evaluate_expanded_candidate_index, initialize_wandb,
+                         validate_epoch,
+                         perform_ranking_validation, test_model)
 from experiment_scheduler import EXPERIMENTS, prepare_jobs
 
 
@@ -95,9 +98,10 @@ def write_synthetic_pairs(path: Path, source: str, count: int, supports_masking:
             "full_sentence_words": words,
             "query_start_idx": query_start,
             "query_end_idx": query_end,
-            "participant_id": f"{source}_p{index % 5}",
+            "participant_id": f"{'task' if task_pair else source}_p{index % 10}",
             "sentence_id": target_index if task_pair else index,
             "question_id": f"task_q{target_index}" if task_pair else f"{source}_q{target_index}",
+            "question_document_id": "authentic_task_text:question{}".format(target_index) if task_pair else "",
             "split_group_id": f"task_trial_{target_index}" if task_pair else f"{source}_target_{target_index}",
             "query_group_id": f"task_q{target_index}_span{index % 4}" if source in {
                 "authentic_query_response", "authentic_question_ict"} else "",
@@ -109,6 +113,8 @@ def write_synthetic_pairs(path: Path, source: str, count: int, supports_masking:
         if source in {"authentic_query_response", "authentic_response_ict"}:
             normalized = " ".join(document.split()).casefold()
             pair["document_id"] = "authentic_task_response:" + hashlib.sha256(normalized.encode()).hexdigest()
+        elif source == "authentic_question_ict":
+            pair["document_id"] = pair["question_document_id"]
         pairs.append(pair)
     np.save(path, {"ict_pairs": pairs, "metadata": {
         "dataset_name": source,
@@ -167,7 +173,11 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
         self.assertEqual(query_response_pair["doc_text"], "edited response")
         self.assertEqual(query_response_pair["document_id"], response_ict_pair["document_id"])
         self.assertEqual(query_response_pair["query_group_id"], question_pair["query_group_id"])
-        self.assertEqual(query_response_pair["split_group_id"], repeated_prompt_pair["split_group_id"])
+        self.assertNotEqual(query_response_pair["split_group_id"], repeated_prompt_pair["split_group_id"])
+        self.assertEqual(question_pair["split_group_id"], query_response_pair["split_group_id"])
+        self.assertEqual(set(question_pair["positive_document_ids"]),
+                         {question_pair["document_id"], response_ict_pair["document_id"]})
+        self.assertEqual(response_ict_pair["positive_document_ids"], [response_ict_pair["document_id"]])
         self.assertNotEqual(query_response_pair["query_group_id"], repeated_prompt_pair["query_group_id"])
         self.assertFalse(query_response_pair["supports_runtime_masking"])
 
@@ -239,18 +249,23 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
             aligned_query_response = np.load(
                 output_dir / "authentic_query_response_aligned_pairs.npy", allow_pickle=True
             ).item()["ict_pairs"]
+            expanded_index = json.loads((output_dir / "authentic_task_expanded_eval_index.json").read_text())
             self.assertEqual(manifest["counts"]["query_response"], 2)
             self.assertEqual(manifest["counts"]["question_ict"], 2)
             self.assertEqual(manifest["counts"]["response_ict"], 2)
             self.assertEqual(query_response[0]["doc_text"], trial["response_seen"])
-            np.testing.assert_array_equal(query_response[0]["query_eeg"], question_ict[0]["query_eeg"])
-            self.assertEqual(query_response[0]["query_group_id"], question_ict[0]["query_group_id"])
+            self.assertEqual(query_response[0]["query_text"], trial["question_text"])
+            self.assertEqual(query_response[0]["query_eeg"].shape[0], len(trial["question_text"].split()))
+            self.assertEqual(query_response[0]["split_group_id"], question_ict[0]["split_group_id"])
             self.assertEqual(query_response[0]["document_id"], response_ict[0]["document_id"])
             self.assertEqual(len(aligned_query_response), 1)
             self.assertTrue(all(pair["alignment_status"] == "aligned_word_index"
                                 for pair in aligned_query_response))
             self.assertTrue(any(pair["alignment_status"] == "unverified_psychopy_to_eeg_offset"
                                 for pair in query_response))
+            self.assertEqual(expanded_index["candidate_count"], 2)
+            self.assertEqual({doc_type for doc in expanded_index["candidate_documents"]
+                              for doc_type in doc["document_types"]}, {"question", "response"})
 
     def test_single_source_loader_deserializes_source_once_for_three_splits(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -346,6 +361,8 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
             )}
 
             for name, source_names in EXPERIMENTS:
+                if name.startswith("typing_"):
+                    continue
                 selected_paths = [paths[source] for source in source_names]
                 pairs, metadata = load_combined_datasets(selected_paths)
                 combined = {"ict_pairs": pairs, "metadata": metadata}
@@ -357,8 +374,13 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                     max_eeg_len=4, train_ratio=0.8, holdout_subjects=False,
                     training_masking_level=90, global_eeg_dims=dimensions,
                     combined_dataset=combined, pair_split_seed=42,
-                    balance_sources=len(source_names) > 1, split_strategy="target",
+                    balance_sources=len(source_names) > 1, split_strategy="original",
                 )
+                split_indices = [set(loader.dataset.indices)
+                                 for loader in (train_loader, val_loader, test_loader)]
+                self.assertFalse(split_indices[0] & split_indices[1], name)
+                self.assertEqual(len(split_indices[0]) + len(split_indices[1]), len(pairs), name)
+                self.assertTrue(split_indices[2] <= split_indices[1], name)
                 self.assertGreater(len(train_loader.dataset), 0, name)
                 self.assertGreater(len(val_loader.dataset), 0, name)
                 self.assertGreater(len(test_loader.dataset), 0, name)
@@ -373,12 +395,13 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
 
                 source_test_loaders = create_source_test_loaders(test_loader)
                 for source, source_loader in source_test_loaders.items():
-                    candidate_ids_by_mask = []
+                    pool_sizes = []
                     for masking_level in (0, 100):
                         source_loader.dataset.dataset.set_masking_probability(masking_level / 100.0)
                         documents, _ = build_document_database(source_loader)
-                        candidate_ids_by_mask.append([document["document_id"] for document in documents])
-                    self.assertEqual(candidate_ids_by_mask[0], candidate_ids_by_mask[1], (name, source))
+                        pool_sizes.append(len(documents))
+                    # Original Audio BPR: candidates are deduplicated by (masked) text.
+                    self.assertLessEqual(pool_sizes[0], pool_sizes[1], (name, source))
 
                 for source, source_loader in source_test_loaders.items():
                     test_ids = {
@@ -441,25 +464,53 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
                 optimizer.step()
 
+                if name == "query_response_only":
+                    expanded_documents = {}
+                    for task_source in ("question_ict", "response_ict"):
+                        task_pairs = np.load(paths[task_source], allow_pickle=True).item()["ict_pairs"]
+                        for task_pair in task_pairs:
+                            expanded_documents[task_pair["document_id"]] = {
+                                "document_id": task_pair["document_id"],
+                                "text": task_pair["doc_text"],
+                                "document_types": [task_source],
+                            }
+                    eval_index = {"candidate_documents": list(expanded_documents.values())}
+                    expanded_metrics = evaluate_expanded_candidate_index(
+                        model, primary_val_loader, torch.device("cpu"), eval_index,
+                        prefix="test_ranking/expanded_index",
+                    )
+                    expanded_noise_metrics = evaluate_expanded_candidate_index(
+                        model, primary_val_loader, torch.device("cpu"), eval_index,
+                        prefix="test_ranking/expanded_index_noise", use_noise=True,
+                    )
+                    self.assertEqual(expanded_metrics["test_ranking/expanded_index/num_unique_documents"],
+                                     len(expanded_documents))
+                    self.assertGreater(expanded_metrics["test_ranking/expanded_index/num_queries_evaluated"], 0)
+                    self.assertIn("test_ranking/expanded_index_noise/rr", expanded_noise_metrics)
+
                 for source, source_loader in source_test_loaders.items():
                     with patch("mv_training.wandb.log"):
                         metrics = test_model(
                             model, source_loader, torch.device("cpu"),
                             test_masking_levels=[0, 100], primary_masking_level=100,
                             wandb_namespace=f"smoke/{source}",
+                            expanded_eval_index=(eval_index if name == "query_response_only"
+                                                 and source == "authentic_query_response" else None),
                         )
                     self.assertEqual(metrics["test_ranking/summary/num_test_samples"],
                                      len(source_loader.dataset), name)
                     self.assertEqual(metrics["test_ranking/summary/has_multiple_datasets"], False, name)
-                    self.assertEqual(
+                    self.assertLessEqual(
                         metrics["test_ranking/masking_0/num_unique_documents"],
                         metrics["test_ranking/masking_100/num_unique_documents"],
                         (name, source),
                     )
-
-            for source, split_sets in test_ids_by_source.items():
-                if split_sets:
-                    self.assertTrue(all(test_set == split_sets[0] for test_set in split_sets), source)
+                    if name == "query_response_only" and source == "authentic_query_response":
+                        self.assertEqual(
+                            metrics["test_ranking/expanded_index/num_unique_documents"],
+                            len(expanded_documents),
+                        )
+                        self.assertIn("test_ranking/expanded_index_noise/rr", metrics)
 
     def test_scheduler_prepares_without_submission(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -472,9 +523,18 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                 "authentic_query_response_pairs.npy", "authentic_question_ict_pairs.npy",
                 "authentic_response_ict_pairs.npy", "authentic_query_response_aligned_pairs.npy",
                 "authentic_question_ict_aligned_pairs.npy", "authentic_response_ict_aligned_pairs.npy",
-                "authentic_task_ict_aligned_pairs.npy",
+                "authentic_task_ict_aligned_pairs.npy", "authentic_task_expanded_eval_index.json",
             ):
                 (task_dir / filename).touch()
+            typing_dir = root / "authentic_typing_pairs"
+            typing_dir.mkdir()
+            for fmt in ("continuous", "keypress"):
+                for kind in ("query_response", "ict"):
+                    (typing_dir / f"authentic_typing_{fmt}_{kind}_pairs.npy").touch()
+            (task_dir / "authentic_task_expanded_eval_index.json").write_text(json.dumps({
+                "candidate_count": 2,
+                "candidate_documents": [],
+            }))
             audio_data = root / "alice_ict_pairs.npy"
             visual_data = root / "nieuwland_ict_pairs.npy"
             audio_data.touch()
@@ -485,13 +545,14 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
             )
             prepared = root / "prepared"
             self.assertFalse(report["submitted"])
-            self.assertEqual(len(report["matrix"]), 7)
+            self.assertEqual(len(report["matrix"]), len(EXPERIMENTS))
             self.assertEqual([item["name"] for item in report["matrix"]],
                              [name for name, _ in EXPERIMENTS])
             self.assertEqual(report["pooling_strategy"], "mean")
             self.assertEqual(report["wandb_project"], "Authentic Queries BPR")
             self.assertIn("aligned_word_index", report["primary_alignment_policy"])
-            self.assertEqual(len(list((prepared / "jobs").glob("*.sbatch"))), 7)
+            self.assertEqual(report["expanded_eval_candidate_count"], 2)
+            self.assertEqual(len(list((prepared / "jobs").glob("*.sbatch"))), len(EXPERIMENTS))
             for script in (prepared / "jobs").glob("*.sbatch"):
                 self.assertIn("#SBATCH --partition=gpu", script.read_text())
                 self.assertIn("controller.py", script.read_text())
@@ -499,8 +560,22 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                 self.assertIn("--no_lora", script.read_text())
                 self.assertIn("--multi-positive-loss", script.read_text())
                 self.assertIn("--wandb-project 'Authentic Queries BPR'", script.read_text())
-                self.assertIn("--split-strategy target", script.read_text())
-                self.assertIn("--primary-eval-source authentic_query_response", script.read_text())
+                self.assertIn("--split-strategy original", script.read_text())
+                self.assertNotIn("--holdout_subjects", script.read_text())
+                self.assertNotIn("--primary-eval-source", script.read_text())
+                self.assertNotIn("--train-sources", script.read_text())
+                self.assertNotIn("--balance_sources", script.read_text())
+                text = script.read_text()
+                if script.stem.startswith("typing_"):
+                    fmt = script.stem.split("_")[1]
+                    self.assertNotIn("--expanded-eval-index", text)
+                    self.assertIn(f"authentic_typing_{fmt}_query_response_pairs.npy", text)
+                    self.assertIn(f"authentic_typing_{fmt}_ict_pairs.npy", text)
+                    self.assertNotIn("authentic_query_response_aligned_pairs.npy", text)
+                else:
+                    self.assertIn("--expanded-eval-index", text)
+                    self.assertIn("authentic_query_response_aligned_pairs.npy", text)
+                self.assertIn("_originalsplit", text)
                 self.assertIn("--wandb-run-name aqbpr_", script.read_text())
             self.assertEqual(report["text_encoder_policy"], "pretrained ColBERT frozen (LoRA disabled)")
             self.assertIn("No jobs were submitted", (prepared / "PREPARED_NOT_SUBMITTED.txt").read_text())
@@ -515,6 +590,8 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
             self.assertEqual([item["name"] for item in selected_report["matrix"]], selected)
             self.assertEqual(selected_report["patience"], 5)
             self.assertEqual(selected_report["matrix"][0]["sources"], ["query_response"])
+            self.assertEqual(selected_report["matrix"][0]["split_strategy"], "original")
+            self.assertEqual(len(selected_report["matrix"][0]["data_paths"]), 1)
             self.assertIn("_aligned_pairs.npy", selected_report["matrix"][0]["data_paths"][0])
             self.assertIn("audio", selected_report["matrix"][1]["sources"])
             self.assertIn("visual", selected_report["matrix"][1]["sources"])
@@ -526,7 +603,7 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                 self.assertIn("--patience 5", command)
                 self.assertIn("#SBATCH --exclude=gpu04", command)
                 self.assertIn("--multi-positive-loss", command)
-                self.assertIn("--split-strategy", command)
+                self.assertIn("--split-strategy original", command)
                 self.assertIn("--wandb-project 'Authentic Queries BPR'", command)
 
     def test_wandb_uses_authentic_queries_project_and_ablation_name(self):
@@ -534,20 +611,25 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
             "encoder_type": "dual", "query_type": "eeg", "pooling_strategy": "mean",
             "eeg_arch": "simple", "dataset_name": "combined", "use_lora": False,
             "experiment_name": "all_task_sources", "wandb_project": "Authentic Queries BPR",
-            "wandb_run_name": "aqbpr_all_task_sources_mean_seed42",
+            "wandb_run_name": "aqbpr_all_task_sources_mean_seed42_expandedindex",
             "enable_multi_masking_validation": True, "multi_positive_loss": True,
             "query_group_multi_positive": True, "primary_task_source": "authentic_query_response",
             "primary_eval_source": "authentic_query_response",
+            "expanded_eval_candidate_count": 48,
+            "expanded_eval_policy": "Questions and displayed responses are both relevant.",
         }
         with patch("mv_training.wandb.init") as wandb_init:
             initialize_wandb(config)
         logged = wandb_init.call_args.kwargs
         self.assertEqual(logged["project"], "Authentic Queries BPR")
-        self.assertEqual(logged["name"], "aqbpr_all_task_sources_mean_seed42_dynamic_mask")
+        self.assertEqual(logged["name"],
+                 "aqbpr_all_task_sources_mean_seed42_expandedindex_dynamic_mask")
         self.assertIn("condition-all_task_sources", logged["tags"])
         self.assertEqual(logged["config"]["primary_task_source"], "authentic_query_response")
         self.assertEqual(logged["config"]["primary_eval_source"], "authentic_query_response")
         self.assertTrue(logged["config"]["query_group_multi_positive"])
+        self.assertEqual(logged["config"]["expanded_eval_candidate_count"], 48)
+        self.assertIn("expanded-multi-positive-index", logged["tags"])
 
     def test_target_grouped_split_keeps_task_question_spans_together(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -584,6 +666,13 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
         )
         self.assertLess(multi_positive_loss.item(), diagonal_loss.item())
 
+    def test_multi_positive_ranking_rewards_either_full_text_target(self):
+        metrics = compute_multi_positive_ranking_metrics([3, 2, 1, 0], {2, 0})
+        self.assertEqual(metrics["rr"], 1.0 / 2.0)
+        self.assertEqual(metrics["hit_at_1"], 0.0)
+        self.assertEqual(metrics["hit_at_5"], 1.0)
+        self.assertAlmostEqual(metrics["recall_at_5"], 1.0)
+
     def test_multi_positive_loss_accepts_distinct_targets_for_same_query_eeg(self):
         query_vectors = torch.tensor([[[1.0, 0.0]], [[1.0, 0.0]], [[0.0, 1.0]]])
         document_vectors = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]], [[0.0, 1.0]]])
@@ -597,6 +686,40 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
             query_group_ids=["same_question_span", "same_question_span", "other_query"],
         )
         self.assertLess(grouped_loss.item(), document_only_loss.item())
+
+    def test_positive_sets_make_question_and_response_both_positive(self):
+        query_vectors = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
+        document_vectors = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
+        ids = ["question", "response"]
+        plain_loss, _ = compute_contrastive_loss(query_vectors, document_vectors, "mean", positive_ids=ids)
+        set_loss, _ = compute_contrastive_loss(
+            query_vectors, document_vectors, "mean", positive_ids=ids,
+            positive_sets=[{"question", "response"}, {"response"}],
+        )
+        self.assertLess(set_loss.item(), plain_loss.item())
+
+    def test_trial_split_keeps_trials_together_and_train_filter_keeps_shared_eval(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = [write_synthetic_pairs(root / f"{source}.npy", source, 120, source == "authentic_question_ict")
+                     for source in ("authentic_query_response", "authentic_question_ict", "authentic_response_ict")]
+            pairs, metadata = load_combined_datasets(paths)
+            from mv_dataloader import compute_combined_eeg_dimensions
+            dimensions = compute_combined_eeg_dimensions(pairs, max_eeg_len=4)
+            common = dict(data_path=None, tokenizer=TinyTokenizer(), batch_size=8, max_text_len=24,
+                          max_eeg_len=4, train_ratio=0.8, holdout_subjects=False,
+                          training_masking_level=90, global_eeg_dims=dimensions,
+                          combined_dataset={"ict_pairs": pairs, "metadata": metadata},
+                          pair_split_seed=42, balance_sources=True, split_strategy="trial")
+            full = create_dataloaders(**common)
+            filtered = create_dataloaders(**common, train_sources=["authentic_query_response"])
+            groups = [{row["split_group_id"] for row in loader.dataset.processed_pairs} for loader in full[:3]]
+            self.assertFalse(groups[0] & groups[1] or groups[0] & groups[2] or groups[1] & groups[2])
+            self.assertEqual({row["dataset_source"] for row in filtered[0].dataset.processed_pairs},
+                             {"authentic_query_response"})
+            for full_loader, filtered_loader in zip(full[1:3], filtered[1:3]):
+                self.assertEqual([row["original_idx"] for row in full_loader.dataset.processed_pairs],
+                                 [row["original_idx"] for row in filtered_loader.dataset.processed_pairs])
 
     def test_mixed_validation_uses_source_pools_without_combined_matrix(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -620,6 +743,24 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                 result = perform_ranking_validation(object(), val_loader, torch.device("cpu"), epoch_num=3)
             self.assertEqual(result, expected)
             source_eval.assert_called_once()
+
+    def test_validation_logs_expanded_index_ranking(self):
+        validation_metrics = {"loss": 0.5, "eeg_query_similarity": 0.1}
+        expanded_metrics = {"val_ranking/expanded_index/rr": 0.4}
+        with patch("mv_training.validate_single_masking_level",
+                   return_value=(validation_metrics, 0.1)), \
+                patch("mv_training.detect_dataset_sources", return_value={"has_multiple": False}), \
+                patch("mv_training.perform_ranking_validation", return_value={}), \
+                patch("mv_training.evaluate_expanded_candidate_index",
+                      return_value=expanded_metrics) as expanded_eval, \
+                patch("mv_training.wandb.log") as wandb_log:
+            loss, metric = validate_epoch(
+                object(), object(), torch.device("cpu"), epoch_num=3,
+                expanded_eval_index={"candidate_documents": [{"document_id": "doc"}]},
+            )
+        self.assertEqual((loss, metric), (0.5, 0.1))
+        expanded_eval.assert_called_once()
+        self.assertIn(expanded_metrics, [call.args[0] for call in wandb_log.call_args_list])
 
 
 if __name__ == "__main__":

@@ -144,7 +144,7 @@ def cross_encoder_validation_step(model, batch, device):
 # ==========================================
 
 def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, temperature=0.07,
-                             positive_ids=None, query_group_ids=None):
+                             positive_ids=None, query_group_ids=None, positive_sets=None):
     """Compute contrastive loss for retrieval - works with any query type"""
 
     # Handle both list and tensor returns based on pooling strategy
@@ -185,7 +185,7 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
             sim = compute_similarity([query_i], [doc_j], pooling_strategy, temperature=1.0)
             logits[i, j] = sim[0] / temperature
 
-    if positive_ids is None and query_group_ids is None:
+    if positive_ids is None and query_group_ids is None and positive_sets is None:
         # Standard one-positive-per-row InfoNCE.
         labels = torch.arange(batch_size, device=device)
         loss = F.cross_entropy(logits, labels)
@@ -194,6 +194,8 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
             raise ValueError("positive_ids must contain one document ID per query")
         if query_group_ids is not None and len(query_group_ids) != batch_size:
             raise ValueError("query_group_ids must contain one group ID per query")
+        if positive_sets is not None and len(positive_sets) != batch_size:
+            raise ValueError("positive_sets must contain one set per query")
         positive_mask = torch.zeros((batch_size, batch_size), dtype=torch.bool, device=device)
         for row in range(batch_size):
             for column in range(batch_size):
@@ -207,7 +209,12 @@ def compute_contrastive_loss(query_vectors, doc_vectors, pooling_strategy, tempe
                     and query_group_ids[row] not in (None, "")
                     and query_group_ids[row] == query_group_ids[column]
                 )
-                positive_mask[row, column] = same_document or same_query
+                in_positive_set = (
+                    positive_sets is not None
+                    and positive_ids is not None
+                    and positive_ids[column] in positive_sets[row]
+                )
+                positive_mask[row, column] = (row == column) or same_document or same_query or in_positive_set
         if not positive_mask.any(dim=1).all():
             raise ValueError("Every query must have at least one in-batch positive document")
         positive_logits = logits.masked_fill(~positive_mask, float('-inf'))
@@ -289,15 +296,18 @@ def dual_encoder_train_step(model, batch, optimizer, device, step_num, debug=Fal
     # Compute contrastive loss
     positive_ids = None
     query_group_ids = None
+    positive_sets = None
     if getattr(model, 'multi_positive_loss', False):
         positive_ids = [item.get('document_id') for item in batch['metadata']]
         query_group_ids = [item.get('query_group_id') for item in batch['metadata']]
+        positive_sets = [set(item.get('positive_document_ids') or []) for item in batch['metadata']]
     loss, query_sims = compute_contrastive_loss(
         outputs['query_vectors'],
         outputs['doc_vectors'],
         model.pooling_strategy,
         positive_ids=positive_ids,
         query_group_ids=query_group_ids,
+        positive_sets=positive_sets,
     )
 
     # Compute alignment metrics
@@ -371,15 +381,18 @@ def dual_encoder_validation_step(model, batch, device):
         # Compute loss and metrics
         positive_ids = None
         query_group_ids = None
+        positive_sets = None
         if getattr(model, 'multi_positive_loss', False):
             positive_ids = [item.get('document_id') for item in batch['metadata']]
             query_group_ids = [item.get('query_group_id') for item in batch['metadata']]
+            positive_sets = [set(item.get('positive_document_ids') or []) for item in batch['metadata']]
         loss, query_sims = compute_contrastive_loss(
             outputs['query_vectors'],
             outputs['doc_vectors'],
             model.pooling_strategy,
             positive_ids=positive_ids,
             query_group_ids=query_group_ids,
+            positive_sets=positive_sets,
         )
 
         metrics = compute_alignment_metrics(
@@ -430,21 +443,20 @@ def build_document_database(val_dataloader):
     for batch in val_dataloader:
         for sample_idx, metadata in enumerate(batch['metadata']):
             doc_text = metadata['document_text'].strip()
-            document_id = metadata.get('document_id') or doc_text
 
             if doc_text:
-                # Add to unique docs if not already present
-                if document_id not in unique_docs:
+                # Keyed by masked text as in the original Audio BPR protocol.
+                if doc_text not in unique_docs:
                     unique_doc_idx = len(unique_docs)
-                    unique_docs[document_id] = {
+                    unique_docs[doc_text] = {
                         'idx': unique_doc_idx,
-                        'document_id': document_id,
+                        'document_id': metadata.get('document_id') or doc_text,
                         'text': doc_text,
                         'input_ids': batch['docs']['input_ids'][sample_idx].clone(),
                         'attention_mask': batch['docs']['attention_mask'][sample_idx].clone()
                     }
                 else:
-                    unique_doc_idx = unique_docs[document_id]['idx']
+                    unique_doc_idx = unique_docs[doc_text]['idx']
 
                 query_to_doc_mapping[query_idx] = unique_doc_idx
             query_idx += 1
@@ -642,6 +654,104 @@ def compute_ranking_metrics(ranked_doc_indices, correct_doc_idx, k_values=[1, 5,
             metrics[f'precision_at_{k}'] = 0.0
             metrics[f'recall_at_{k}'] = 0.0
 
+    return metrics
+
+
+def compute_multi_positive_ranking_metrics(ranked_doc_indices, relevant_doc_indices,
+                                           k_values=(1, 5, 10, 20)):
+    """Score a ranking when any of several documents is a valid positive."""
+    relevant = set(relevant_doc_indices)
+    ranks = [rank for rank, doc_index in enumerate(ranked_doc_indices, start=1)
+             if doc_index in relevant]
+    first_rank = min(ranks) if ranks else len(ranked_doc_indices) + 1
+    metrics = {
+        "rr": 1.0 / first_rank if ranks else 0.0,
+        "rank_of_first_relevant": first_rank,
+        "num_relevant_documents": len(relevant),
+    }
+    for k in k_values:
+        hits = sum(rank <= k for rank in ranks)
+        metrics[f"hit_at_{k}"] = float(hits > 0)
+        metrics[f"precision_at_{k}"] = hits / k
+        metrics[f"recall_at_{k}"] = hits / len(relevant) if relevant else 0.0
+    return metrics
+
+
+def build_expanded_candidate_database(eval_index, dataloader):
+    """Tokenize the fixed full-question plus displayed-response candidate index."""
+    dataset = dataloader.dataset
+    while hasattr(dataset, "dataset"):
+        dataset = dataset.dataset
+
+    documents = []
+    document_indices = {}
+    for candidate in eval_index["candidate_documents"]:
+        document_id = candidate["document_id"]
+        encoded = dataset._tokenize_text(candidate["text"], is_query=False)
+        document_indices[document_id] = len(documents)
+        documents.append({
+            "idx": len(documents),
+            "document_id": document_id,
+            "text": candidate["text"],
+            "document_types": candidate.get("document_types", []),
+            "input_ids": encoded["input_ids"].clone(),
+            "attention_mask": encoded["attention_mask"].clone(),
+        })
+    return documents, document_indices
+
+
+def evaluate_expanded_candidate_index(model, dataloader, device, eval_index,
+                                     prefix, masking_level=90, use_noise=False):
+    """Rank each query against the fixed full-text index with two positives where available."""
+    documents, document_indices = build_expanded_candidate_database(eval_index, dataloader)
+    if not documents:
+        return {}
+
+    all_metrics = []
+    metric_sources = []
+    doc_indices = list(range(len(documents)))
+    model.eval()
+    for batch in dataloader:
+        eeg_queries = batch["eeg_queries"]
+        eeg_masks = batch["eeg_mv_masks"]
+        for sample_index, metadata in enumerate(batch["metadata"]):
+            positive_ids = set(metadata.get("positive_document_ids") or [])
+            positive_ids.add(metadata.get("document_id"))
+            positive_indices = {
+                document_indices[document_id]
+                for document_id in positive_ids
+                if document_id in document_indices
+            }
+            if not positive_indices:
+                continue
+
+            eeg_query = eeg_queries[sample_index:sample_index + 1].to(device)
+            eeg_mask = eeg_masks[sample_index:sample_index + 1].to(device)
+            if use_noise:
+                eeg_query = generate_eeg_noise_baseline(eeg_query)
+            ranked_indices, _ = rank_dual_encoder_subset(
+                model, eeg_query, eeg_mask, documents, doc_indices, device)
+            all_metrics.append(compute_multi_positive_ranking_metrics(
+                ranked_indices, positive_indices))
+            metric_sources.append(metadata.get("dataset_source", "unknown"))
+
+    if not all_metrics:
+        return {}
+
+    metrics = {}
+    for metric_name in all_metrics[0]:
+        metrics[f"{prefix}/{metric_name}"] = float(np.mean([row[metric_name] for row in all_metrics]))
+    metrics.update({
+        f"{prefix}/num_unique_documents": len(documents),
+        f"{prefix}/num_queries_evaluated": len(all_metrics),
+        f"{prefix}/masking_level": masking_level,
+    })
+    for source in sorted(set(metric_sources)):
+        rows = [row for row, row_source in zip(all_metrics, metric_sources) if row_source == source]
+        for metric_name in ("rr", "hit_at_1", "hit_at_5", "hit_at_10", "recall_at_10"):
+            metrics[f"{prefix}/by_source/{source}/{metric_name}"] = float(
+                np.mean([row[metric_name] for row in rows]))
+        metrics[f"{prefix}/by_source/{source}/num_queries_evaluated"] = len(rows)
     return metrics
 
 
@@ -864,7 +974,8 @@ def split_validation_data_by_dataset(val_dataloader):
             dataset_source = metadata.get('dataset_source', 'unknown')
 
             # More robust dataset name extraction
-            if dataset_source.lower() in {'authentic_question_ict', 'authentic_response_ict'}:
+            if dataset_source.lower() in {'authentic_question_ict', 'authentic_response_ict'} \
+                    or dataset_source.lower().startswith('authentic_typing_'):
                 dataset_name = dataset_source.lower()
             elif 'nieuwland' in dataset_source.lower():
                 dataset_name = 'nieuwland'
@@ -1051,26 +1162,30 @@ def rank_dual_encoder_subset(model, eeg_query, eeg_mv_mask, doc_list, doc_indice
         else:
             query_vectors = query_vectors[0:1]  # Keep as batch of 1
 
-        # BATCH encode ALL documents in the subset at once
-        doc_input_ids = torch.stack([doc_list[doc_idx]['input_ids'] for doc_idx in doc_indices]).to(device)
-        doc_attention_masks = torch.stack([doc_list[doc_idx]['attention_mask'] for doc_idx in doc_indices]).to(device)
+        # doc_list is rebuilt for every evaluation, so caching encodings on it cannot go stale.
+        missing = [doc_idx for doc_idx in doc_indices if 'cached_vectors' not in doc_list[doc_idx]]
+        for start in range(0, len(missing), 64):
+            chunk = missing[start:start + 64]
+            doc_input_ids = torch.stack([doc_list[doc_idx]['input_ids'] for doc_idx in chunk]).to(device)
+            doc_attention_masks = torch.stack([doc_list[doc_idx]['attention_mask'] for doc_idx in chunk]).to(device)
+            batch_doc_vectors = model.encode_text(doc_input_ids, doc_attention_masks)
+            for offset, doc_idx in enumerate(chunk):
+                if isinstance(batch_doc_vectors, list):
+                    doc_list[doc_idx]['cached_vectors'] = batch_doc_vectors[offset]
+                else:
+                    doc_list[doc_idx]['cached_vectors'] = batch_doc_vectors[offset:offset + 1]
+        doc_vectors_list = [doc_list[doc_idx]['cached_vectors'] for doc_idx in doc_indices]
 
-        # Single batch encoding for ALL documents
-        batch_doc_vectors = model.encode_text(doc_input_ids, doc_attention_masks)
-
-        # Handle different pooling strategies
-        if isinstance(batch_doc_vectors, list):
-            # Multi-vector pooling
-            doc_vectors_list = batch_doc_vectors
+        if model.pooling_strategy in ('cls', 'max', 'mean'):
+            query_norm = F.normalize(query_vectors.reshape(-1), p=2, dim=0)
+            doc_matrix = F.normalize(torch.stack([vec.reshape(-1) for vec in doc_vectors_list]), p=2, dim=1)
+            similarity_values = (doc_matrix @ query_norm).tolist()
+            scores = list(zip(doc_indices, similarity_values))
         else:
-            # CLS pooling - split batch back to individual documents
-            doc_vectors_list = [batch_doc_vectors[i:i + 1] for i in range(batch_doc_vectors.size(0))]
-
-        # Compute similarities in batch
-        scores = []
-        for i, doc_vectors in enumerate(doc_vectors_list):
-            sim = compute_similarity([query_vectors], [doc_vectors], model.pooling_strategy, temperature=1.0)
-            scores.append((doc_indices[i], sim[0].item()))
+            scores = []
+            for i, doc_vectors in enumerate(doc_vectors_list):
+                sim = compute_similarity([query_vectors], [doc_vectors], model.pooling_strategy, temperature=1.0)
+                scores.append((doc_indices[i], sim[0].item()))
 
     # Sort by score (descending)
     scores.sort(key=lambda x: x[1], reverse=True)
@@ -1323,7 +1438,7 @@ def validate_epoch(model, val_dataloader, device, epoch_num,
                    enable_multi_masking_validation=False,
                    validation_masking_levels=[0, 25, 50, 75, 90, 100],
                    multi_masking_frequency=3,
-                   primary_masking_level=90):
+                   primary_masking_level=90, expanded_eval_index=None):
     """
     Enhanced validate_epoch with DYNAMIC multi-masking support + dataset-specific validation
 
@@ -1473,6 +1588,12 @@ def validate_epoch(model, val_dataloader, device, epoch_num,
             ranking_metrics = perform_ranking_validation(
                 model, val_dataloader, device, epoch_num, subset_size=None
             )
+        if expanded_eval_index is not None:
+            expanded_metrics = evaluate_expanded_candidate_index(
+                model, val_dataloader, device, expanded_eval_index,
+                prefix="val_ranking/expanded_index", masking_level=primary_masking_level,
+            )
+            wandb.log(expanded_metrics)
 
     # Return primary metrics for early stopping
     return primary_metrics['loss'], primary_main_metric
@@ -1537,6 +1658,8 @@ def initialize_wandb(config):
     if config.get('experiment_name'):
         tags.extend(['authentic-query-response', 'ablation', f"condition-{config['experiment_name']}"])
         tags.extend(f"source-{source}" for source in config.get('ablation_sources', []))
+    if config.get('expanded_eval_candidate_count', 0):
+        tags.append('expanded-multi-positive-index')
 
     # NEW: Add query type specific tags
     if query_type == 'text':
@@ -1554,6 +1677,9 @@ def initialize_wandb(config):
             'wandb_project': config.get('wandb_project', 'ECIR2026'),
             'primary_task_source': config.get('primary_task_source'),
             'primary_eval_source': config.get('primary_eval_source'),
+            'expanded_eval_index_path': config.get('expanded_eval_index_path'),
+            'expanded_eval_candidate_count': config.get('expanded_eval_candidate_count', 0),
+            'expanded_eval_policy': config.get('expanded_eval_policy'),
             'query_group_multi_positive': config.get('query_group_multi_positive', False),
             'encoder_type': encoder_type,
             'query_type': query_type,
@@ -1615,7 +1741,7 @@ def train_model(model, train_dataloader, val_dataloader, optimizer, num_epochs,
                 patience=10, device='cuda', debug=False, config=None,
                 enable_multi_masking_validation=False, multi_masking_frequency=3,
                 validation_masking_levels=[0, 25, 50, 75, 90, 100],
-                primary_masking_level=90):
+                primary_masking_level=90, expanded_eval_index=None):
     """
     Complete training loop with validation and early stopping + DYNAMIC MULTI-MASKING VALIDATION
 
@@ -1688,7 +1814,8 @@ def train_model(model, train_dataloader, val_dataloader, optimizer, num_epochs,
             enable_multi_masking_validation=enable_multi_masking_validation,
             validation_masking_levels=validation_masking_levels,
             multi_masking_frequency=multi_masking_frequency,
-            primary_masking_level=primary_masking_level
+            primary_masking_level=primary_masking_level,
+            expanded_eval_index=expanded_eval_index,
         )
 
         # Early stopping logic - use loss for primary criterion
@@ -1772,7 +1899,7 @@ def train_model(model, train_dataloader, val_dataloader, optimizer, num_epochs,
 
 def test_model(model, test_dataloader, device, debug=False,
                test_masking_levels=[0, 25, 50, 75, 90, 100],
-               primary_masking_level=90, wandb_namespace=None):
+               primary_masking_level=90, wandb_namespace=None, expanded_eval_index=None):
     """
     Comprehensive test evaluation with MULTI-MASKING support
 
@@ -1857,6 +1984,19 @@ def test_model(model, test_dataloader, device, debug=False,
             model, test_dataloader, device, primary_masking_level
         )
         all_test_metrics.update(noise_ranking_results)
+
+        if expanded_eval_index is not None:
+            expanded_results = evaluate_expanded_candidate_index(
+                model, test_dataloader, device, expanded_eval_index,
+                prefix="test_ranking/expanded_index", masking_level=primary_masking_level,
+            )
+            expanded_noise_results = evaluate_expanded_candidate_index(
+                model, test_dataloader, device, expanded_eval_index,
+                prefix="test_ranking/expanded_index_noise", masking_level=primary_masking_level,
+                use_noise=True,
+            )
+            all_test_metrics.update(expanded_results)
+            all_test_metrics.update(expanded_noise_results)
 
         # 5. Calculate cross-masking performance comparisons
         masking_comparison_metrics = calculate_masking_performance_trends(
