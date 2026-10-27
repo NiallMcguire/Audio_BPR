@@ -360,7 +360,7 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                 "authentic_question_ict", "authentic_response_ict",
             )}
 
-            for name, source_names in EXPERIMENTS:
+            for name, source_names, *_ in EXPERIMENTS:
                 if name.startswith("typing_"):
                     continue
                 selected_paths = [paths[source] for source in source_names]
@@ -528,8 +528,8 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                 (task_dir / filename).touch()
             typing_dir = root / "authentic_typing_pairs"
             typing_dir.mkdir()
-            for fmt in ("continuous", "keypress"):
-                for kind in ("query_response", "ict"):
+            for fmt in ("continuous", "keypress", "word"):
+                for kind in ("query_response", "ict", "question_ict"):
                     (typing_dir / f"authentic_typing_{fmt}_{kind}_pairs.npy").touch()
             (task_dir / "authentic_task_expanded_eval_index.json").write_text(json.dumps({
                 "candidate_count": 2,
@@ -547,7 +547,7 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
             self.assertFalse(report["submitted"])
             self.assertEqual(len(report["matrix"]), len(EXPERIMENTS))
             self.assertEqual([item["name"] for item in report["matrix"]],
-                             [name for name, _ in EXPERIMENTS])
+                             [name for name, *_ in EXPERIMENTS])
             self.assertEqual(report["pooling_strategy"], "mean")
             self.assertEqual(report["wandb_project"], "Authentic Queries BPR")
             self.assertIn("aligned_word_index", report["primary_alignment_policy"])
@@ -562,16 +562,30 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                 self.assertIn("--wandb-project 'Authentic Queries BPR'", script.read_text())
                 self.assertIn("--split-strategy original", script.read_text())
                 self.assertNotIn("--holdout_subjects", script.read_text())
-                self.assertNotIn("--primary-eval-source", script.read_text())
                 self.assertNotIn("--train-sources", script.read_text())
-                self.assertNotIn("--balance_sources", script.read_text())
                 text = script.read_text()
+                if script.stem.startswith("typing_v2_"):
+                    fmt = script.stem.split("_")[2]
+                    for flag in ("--lr 3e-05", "--patience 20", "--min-epochs 10", "--grad-clip 5.0",
+                                 "--max_eeg_len 100", "--primary-eval-source authentic_typing"):
+                        self.assertIn(flag, text)
+                    self.assertIn(f"authentic_typing_{fmt}_question_ict_pairs.npy", text)
+                    self.assertEqual("--balance_sources" in text,
+                                     "audio" in script.stem or "visual" in script.stem)
+                    if "_seed" in script.stem:
+                        self.assertIn(f"--seed {script.stem.rsplit('seed', 1)[1]}", text)
+                else:
+                    for flag in ("--primary-eval-source", "--balance_sources", "--grad-clip",
+                                 "--min-epochs", "--max_eeg_len"):
+                        self.assertNotIn(flag, text)
+                    self.assertIn("--lr 1e-05", text)
                 if script.stem.startswith("typing_"):
-                    fmt = script.stem.split("_")[1]
+                    fmt = script.stem.split("_")[2 if script.stem.startswith("typing_v2_") else 1]
                     self.assertNotIn("--expanded-eval-index", text)
                     self.assertIn(f"authentic_typing_{fmt}_query_response_pairs.npy", text)
-                    self.assertIn(f"authentic_typing_{fmt}_ict_pairs.npy", text)
                     self.assertNotIn("authentic_query_response_aligned_pairs.npy", text)
+                    if not script.stem.startswith("typing_v2_"):
+                        self.assertIn(f"authentic_typing_{fmt}_ict_pairs.npy", text)
                 else:
                     self.assertIn("--expanded-eval-index", text)
                     self.assertIn("authentic_query_response_aligned_pairs.npy", text)

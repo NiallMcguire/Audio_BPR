@@ -1,8 +1,12 @@
-"""Build typing-EEG pairs: full typing EEG -> response_seen, and typing-span ICT -> typed query.
+"""Build typing-EEG pairs: full typing EEG -> response_seen, and typing-span ICT pairs.
 
-Two EEG formats are written for the same trials and spans:
+Three EEG formats are written for the same trials and spans:
 - continuous: consecutive 513-sample (1 s) windows of the raw typing EEG.
 - keypress: one -200..800 ms epoch per surviving keypress of the submitted query.
+- word: one -200..800 ms epoch per typed word, anchored at its first surviving key.
+
+Two ICT targets: the submitted typed query (`ict`) and the displayed question with the
+matching span masked (`question_ict`, only for spans found verbatim in the question).
 """
 
 from __future__ import annotations
@@ -35,7 +39,8 @@ from typing_annotations import read_windows, replay, text_matches  # noqa: E402
 
 DEFAULT_DATASET_DIR = REPO_ROOT / "dataset"
 DEFAULT_OUTPUT_DIR = DEFAULT_DATASET_DIR / "authentic_typing_pairs"
-FORMATS = ("continuous", "keypress")
+FORMATS = ("continuous", "keypress", "word")
+KINDS = ("query_response", "ict", "question_ict")
 WINDOW_SAMPLES = 513
 EPOCH_PRE_SAMPLES = 102  # matches reading epochs: tmin = -102/512 s
 CLOCK_TOLERANCE_S = 0.05
@@ -67,17 +72,38 @@ def _continuous_windows(data: np.ndarray, start: int, stop: int) -> list[np.ndar
     return windows
 
 
+def _normalize_token(token: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", token.casefold())
+
+
+def _question_span(question: str, typed_tokens: list[str], start: int, end: int) -> tuple[int, int] | None:
+    """Locate the typed span verbatim (case/punctuation-insensitive) in the displayed question."""
+    wanted = [_normalize_token(token) for token in typed_tokens[start:end]]
+    if not all(wanted):
+        return None
+    question_tokens = [_normalize_token(token) for token in question.split()]
+    for left in range(len(question_tokens) - len(wanted) + 1):
+        if question_tokens[left:left + len(wanted)] == wanted:
+            return left, left + len(wanted)
+    return None
+
+
 def _pair(record: dict, fmt: str, kind: str, typed_text: str, tokens: list[str], start: int, end: int,
-          eeg_units: list[np.ndarray], source_path: Path) -> dict:
+          eeg_units: list[np.ndarray], source_path: Path, doc_span: tuple[int, int] | None = None) -> dict:
     typed_document_id = _task_document_id(typed_text)
+    doc_start, doc_end = start, end
     if kind == "query_response":
         doc_text = record["response_seen"].strip()
         response_document_id = _task_document_id(doc_text)
         positive_document_ids = [typed_document_id, response_document_id]
         query_group_id = ""
     else:
-        doc_text = typed_text
-        positive_document_ids = [typed_document_id]
+        if kind == "question_ict":
+            doc_text = record["question_text"].strip()
+            doc_start, doc_end = doc_span
+        else:
+            doc_text = typed_text
+        positive_document_ids = [_task_document_id(doc_text)]
         query_group_id = hashlib.sha256("\0".join(map(str, (
             record["participant_id"], record["session_id"], record["part"], record["trial"],
             record["question_id"], "typing", start, end))).encode("utf-8")).hexdigest()
@@ -91,8 +117,8 @@ def _pair(record: dict, fmt: str, kind: str, typed_text: str, tokens: list[str],
         "doc_words": doc_words,
         "full_sentence_text": doc_text,
         "full_sentence_words": doc_words,
-        "query_start_idx": start,
-        "query_end_idx": end,
+        "query_start_idx": doc_start,
+        "query_end_idx": doc_end,
         "participant_id": record["participant_id"],
         "session_id": record["session_id"],
         "part": int(record["part"]),
@@ -107,7 +133,7 @@ def _pair(record: dict, fmt: str, kind: str, typed_text: str, tokens: list[str],
         "split_group_id": "task_trial:" + "|".join(
             str(record[field]) for field in ("participant_id", "session_id", "part", "trial", "question_id")),
         "query_group_id": query_group_id,
-        "query_kind": f"typing_{fmt}_{'to_response' if kind == 'query_response' else 'ict'}",
+        "query_kind": f"typing_{fmt}_{'to_response' if kind == 'query_response' else kind}",
         "typing_format": fmt,
         "num_eeg_units": len(eeg_units),
         "condition": record["condition"],
@@ -118,7 +144,7 @@ def _pair(record: dict, fmt: str, kind: str, typed_text: str, tokens: list[str],
         "answer_provenance": record["answer_provenance"],
         "dataset_source": f"authentic_typing_{fmt}_{kind}",
         "training_source": "authentic_typing",
-        "supports_runtime_masking": kind == "ict",
+        "supports_runtime_masking": kind != "query_response",
         "alignment_status": "aligned_keystroke_log",
         "source_eeg_file": str(source_path),
         "document_id": _task_document_id(doc_text),
@@ -217,11 +243,19 @@ def _build_session(participant: str, session_dir: Path, psychopy_csv: Path, reco
         logged = [event["log_time_s"] for event in window["keys"]]
         continuous_full = _continuous_windows(data, sample(min(logged)) - EPOCH_PRE_SAMPLES,
                                               sample(max(logged)) + WINDOW_SAMPLES - EPOCH_PRE_SAMPLES)
-        if not keypress or not continuous_full:
+        words = []
+        for index, times in sorted(word_times.items()):
+            left = sample(min(times)) - EPOCH_PRE_SAMPLES
+            if left < 0 or left + WINDOW_SAMPLES > data.shape[1]:
+                counters["word_epochs_outside_typing_eeg"] += 1
+                continue
+            words.append((index, data[:, left:left + WINDOW_SAMPLES]))
+        if not keypress or not continuous_full or not words:
             counters["trials_without_usable_typing_eeg"] += 1
             continue
         counters["typing_trials_used"] += 1
-        full_units = {"continuous": continuous_full, "keypress": [eeg for _, eeg, _ in keypress]}
+        full_units = {"continuous": continuous_full, "keypress": [eeg for _, eeg, _ in keypress],
+                      "word": [eeg for _, eeg in words]}
         for fmt in FORMATS:
             pairs[fmt]["query_response"].append(
                 _pair(record, fmt, "query_response", typed_text, tokens, 0, len(tokens), full_units[fmt], segment_path))
@@ -234,15 +268,22 @@ def _build_session(participant: str, session_dir: Path, psychopy_csv: Path, reco
         for start, end, _ in spans:
             span_times = [t for index in range(start, end) for t in word_times.get(index, [])]
             span_keys = [eeg for index, eeg, _ in keypress if start <= index < end]
+            span_words = [eeg for index, eeg in words if start <= index < end]
             span_windows = _continuous_windows(data, sample(min(span_times)) - EPOCH_PRE_SAMPLES,
                                                sample(max(span_times)) + WINDOW_SAMPLES - EPOCH_PRE_SAMPLES)
-            if not span_keys or not span_windows:
+            if not span_keys or not span_windows or not span_words:
                 counters["ict_spans_without_usable_eeg"] += 1
                 continue
-            span_units = {"continuous": span_windows, "keypress": span_keys}
+            span_units = {"continuous": span_windows, "keypress": span_keys, "word": span_words}
+            question_span = _question_span(record["question_text"], tokens, start, end)
+            counters["question_ict_spans_matched" if question_span else "question_ict_spans_not_in_question"] += 1
             for fmt in FORMATS:
                 pairs[fmt]["ict"].append(
                     _pair(record, fmt, "ict", typed_text, tokens, start, end, span_units[fmt], segment_path))
+                if question_span:
+                    pairs[fmt]["question_ict"].append(
+                        _pair(record, fmt, "question_ict", typed_text, tokens, start, end, span_units[fmt],
+                              segment_path, doc_span=question_span))
 
 
 def build_typing_pairs(dataset_dir: Path = DEFAULT_DATASET_DIR, output_dir: Path = DEFAULT_OUTPUT_DIR,
@@ -253,37 +294,45 @@ def build_typing_pairs(dataset_dir: Path = DEFAULT_DATASET_DIR, output_dir: Path
     for row in _read_rows(dataset_dir / "trial_response_ground_truth.csv"):
         records[(row["participant_id"], row["session_id"], row["part"], row["trial"], row["question_id"])] = row
     counters = defaultdict(int)
-    pairs = {fmt: {"query_response": [], "ict": []} for fmt in FORMATS}
+    pairs = {fmt: {kind: [] for kind in KINDS} for fmt in FORMATS}
     for participant, session_dir, psychopy_csv in _session_inputs(dataset_dir):
         _build_session(participant, session_dir, psychopy_csv, records, random_seed, query_ratio,
                        min_query_length, max_query_length, pairs_per_trial, counters, pairs)
-    if not all(pairs[fmt][kind] for fmt in FORMATS for kind in ("query_response", "ict")):
+    if not all(pairs[fmt][kind] for fmt in FORMATS for kind in KINDS):
         raise ValueError(f"Missing typing pairs: { {fmt: {k: len(v) for k, v in p.items()} for fmt, p in pairs.items()} }")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     summary = {}
+    definitions = {
+        "query_response": "full typing EEG -> same-trial response_seen",
+        "ict": "typing-span EEG -> full submitted typed query (span masked at runtime)",
+        "question_ict": "typing-span EEG -> displayed question (verbatim-matched span masked at runtime)",
+    }
+    units = {
+        "continuous": "consecutive 513-sample (1 s) windows from first logged key -200 ms to last logged key +800 ms",
+        "keypress": "one -200..800 ms epoch per keypress surviving into the submitted query, in typing order",
+        "word": "one -200..800 ms epoch per typed word, anchored at the word's first surviving keypress",
+    }
     for fmt in FORMATS:
-        for kind in ("query_response", "ict"):
+        for kind in KINDS:
             items = pairs[fmt][kind]
             lengths = [pair["num_eeg_units"] for pair in items]
             metadata = {
                 "dataset_name": f"authentic_typing_{fmt}_{kind}",
-                "version": "authentic_typing_v1",
-                "supports_runtime_masking": kind == "ict",
+                "version": "authentic_typing_v2",
+                "supports_runtime_masking": kind != "query_response",
                 "training_source": "authentic_typing",
                 "typing_format": fmt,
-                "pair_definition": ("full typing EEG -> same-trial response_seen" if kind == "query_response"
-                                    else "typing-span EEG -> full submitted typed query (span masked at runtime)"),
-                "eeg_units": ("consecutive 513-sample (1 s) windows from first logged key -200 ms to last logged key +800 ms"
-                              if fmt == "continuous" else
-                              "one -200..800 ms epoch per keypress surviving into the submitted query, in typing order"),
+                "pair_definition": definitions[kind],
+                "eeg_units": units[fmt],
                 "keystroke_policy": "Only trials whose PsychoPy log replays to the submitted text and passes the 50 ms clock check.",
                 "sampling": {"random_seed": random_seed, "query_ratio": query_ratio,
                              "min_query_length": min_query_length, "max_query_length": max_query_length,
                              "pairs_per_trial": pairs_per_trial, "spans_shared_across_formats": True},
                 "count": len(items),
                 "eeg_units_per_pair": {"min": min(lengths), "median": float(np.median(lengths)),
-                                       "max": max(lengths), "over_50": sum(n > 50 for n in lengths)},
+                                       "max": max(lengths), "over_50": sum(n > 50 for n in lengths),
+                                       "over_100": sum(n > 100 for n in lengths)},
                 "participants": len({pair["participant_id"] for pair in items}),
                 "counters": dict(counters),
                 "created_utc": datetime.now(timezone.utc).isoformat(),

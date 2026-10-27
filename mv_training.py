@@ -72,7 +72,7 @@ def cross_encoder_train_step(model, batch, optimizer, device, step_num, debug=Fa
     # Backward pass
     optimizer.zero_grad()
     total_loss.backward()
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=getattr(model, 'grad_clip_norm', 1.0))
     optimizer.step()
 
     # Log metrics
@@ -323,7 +323,7 @@ def dual_encoder_train_step(model, batch, optimizer, device, step_num, debug=Fal
     loss.backward()
 
     # Clip gradients
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=getattr(model, 'grad_clip_norm', 1.0))
 
     optimizer.step()
 
@@ -1833,7 +1833,7 @@ def train_model(model, train_dataloader, val_dataloader, optimizer, num_epochs,
             epochs_without_improvement += 1
             print(f"No improvement for {epochs_without_improvement}/{patience} epochs")
 
-            if epochs_without_improvement >= patience:
+            if epochs_without_improvement >= patience and epoch_num >= (config or {}).get('min_epochs', 0):
                 print(f"Early stopping triggered after {epoch_num} epochs!")
                 print(f"Best validation loss: {best_val_loss:.4f} (epoch {best_epoch})")
                 early_stopped = True

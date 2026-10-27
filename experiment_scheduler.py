@@ -11,6 +11,11 @@ from pathlib import Path
 
 
 AUDIO_BPR_DIR = Path(__file__).resolve().parent
+# Typing-only training settings; reading arms keep the original Audio BPR flags.
+TYPING_V2_SETTINGS = {"learning_rate": 3e-5, "patience": 20, "min_epochs": 10, "grad_clip": 5.0,
+                      "max_eeg_len": 100, "primary_eval_source": "authentic_typing"}
+TYPING_V2_SEEDS = (42, 43, 44)
+TYPING_FORMATS = ("continuous", "keypress", "word")
 EXPERIMENTS = (
     ("query_response_only", ("query_response",)),
     ("query_response_plus_question_ict", ("query_response", "question_ict")),
@@ -26,6 +31,14 @@ EXPERIMENTS = (
     *((f"typing_{fmt}{suffix}", (f"typing_{fmt}_query_response", f"typing_{fmt}_ict", *extra))
       for fmt in ("continuous", "keypress")
       for suffix, extra in (("", ()), ("_audio", ("audio",)), ("_visual", ("visual",)),
+                            ("_audio_visual", ("audio", "visual")))),
+    *((f"typing_v2_{fmt}_seed{seed}", (f"typing_{fmt}_query_response", f"typing_{fmt}_question_ict"),
+       {**TYPING_V2_SETTINGS, "seed": seed})
+      for fmt in TYPING_FORMATS for seed in TYPING_V2_SEEDS),
+    *((f"typing_v2_{fmt}{suffix}", (f"typing_{fmt}_query_response", f"typing_{fmt}_question_ict", *extra),
+       {**TYPING_V2_SETTINGS, "balance_sources": True})
+      for fmt in TYPING_FORMATS
+      for suffix, extra in (("_audio", ("audio",)), ("_visual", ("visual",)),
                             ("_audio_visual", ("audio", "visual")))),
 )
 READING_TASK_SOURCES = {"query_response", "question_ict", "response_ict"}
@@ -43,14 +56,15 @@ def build_plan(audio_data: Path, visual_data: Path, task_data: Path,
         "response_ict": str(task_dir / "authentic_response_ict_aligned_pairs.npy"),
         **{f"typing_{fmt}_{kind}": str(task_dir.parent / "authentic_typing_pairs"
                                         / f"authentic_typing_{fmt}_{kind}_pairs.npy")
-           for fmt in ("continuous", "keypress") for kind in ("query_response", "ict")},
+           for fmt in TYPING_FORMATS for kind in ("query_response", "ict", "question_ict")},
     }
     selected_names = set(experiment_names) if experiment_names is not None else None
     plan = []
-    for name, source_names in EXPERIMENTS:
+    for name, source_names, *rest in EXPERIMENTS:
         if selected_names is not None and name not in selected_names:
             continue
         plan.append({"name": name, "sources": list(source_names), "split_strategy": "original",
+                     "overrides": dict(rest[0]) if rest else {},
                      "expanded_eval_index": (expanded_eval_index
                                              if READING_TASK_SOURCES & set(source_names) else None),
                      "data_paths": [sources[source] for source in source_names]})
@@ -64,6 +78,10 @@ def _controller_command(experiment: dict, output_path: Path, python_executable: 
                         use_pretrained_text: bool, use_lora: bool,
                         pooling_strategy: str, wandb_project: str) -> list[str]:
     command = [python_executable, str(AUDIO_BPR_DIR / "controller.py")]
+    overrides = experiment.get("overrides", {})
+    seed = overrides.get("seed", seed)
+    patience = overrides.get("patience", patience)
+    learning_rate = overrides.get("learning_rate", learning_rate)
     paths = experiment["data_paths"]
     if len(paths) == 1:
         command.extend(["--data_path", paths[0]])
@@ -92,6 +110,16 @@ def _controller_command(experiment: dict, output_path: Path, python_executable: 
         "--wandb-run-name", f"aqbpr_{experiment['name']}_mean_seed{seed}_originalsplit",
         "--split-strategy", experiment["split_strategy"],
     ])
+    if "grad_clip" in overrides:
+        command.extend(["--grad-clip", str(overrides["grad_clip"])])
+    if "min_epochs" in overrides:
+        command.extend(["--min-epochs", str(overrides["min_epochs"])])
+    if "max_eeg_len" in overrides:
+        command.extend(["--max_eeg_len", str(overrides["max_eeg_len"])])
+    if "primary_eval_source" in overrides:
+        command.extend(["--primary-eval-source", overrides["primary_eval_source"]])
+    if overrides.get("balance_sources") and len(paths) > 1:
+        command.append("--balance_sources")
     command.append("--multi-positive-loss")
     if use_pretrained_text:
         command.append("--use_pretrained_text")
@@ -231,7 +259,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--experiments", nargs="+", choices=[name for name, _ in EXPERIMENTS],
+    parser.add_argument("--experiments", nargs="+", choices=[name for name, *_ in EXPERIMENTS],
                         default=None, help="Subset of experiment conditions to prepare")
     parser.add_argument("--wandb-project", default="Authentic Queries BPR")
     parser.add_argument("--batch-size", type=int, default=32)

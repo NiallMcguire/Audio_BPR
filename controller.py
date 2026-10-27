@@ -253,6 +253,9 @@ def main():
                         help='dataset_source values used for training; val/test keep all loaded sources')
     parser.add_argument('--multi-positive-loss', action='store_true',
                         help='Treat repeated in-batch examples of the same target document as positives')
+    parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient-norm clipping threshold')
+    parser.add_argument('--min-epochs', type=int, default=0,
+                        help='Do not early-stop before this many epochs')
 
     # Masking arguments
     parser.add_argument('--training_masking_level', type=int, default=90,
@@ -413,6 +416,9 @@ def main():
         'split_strategy': args.split_strategy,
         'balance_sources': args.balance_sources,
         'multi_positive_loss': args.multi_positive_loss,
+        'grad_clip': args.grad_clip,
+        'min_epochs': args.min_epochs,
+        'max_eeg_len': args.max_eeg_len,
         'query_group_multi_positive': args.multi_positive_loss,
         'primary_task_source': 'authentic_query_response' if args.experiment_name else None,
         'primary_eval_source': args.primary_eval_source,
@@ -474,6 +480,7 @@ def main():
     if not args.use_pretrained_text:
         model.set_tokenizer_vocab_size(len(tokenizer))
     model.multi_positive_loss = args.multi_positive_loss
+    model.grad_clip_norm = args.grad_clip
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
