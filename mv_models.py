@@ -380,6 +380,10 @@ class SimplifiedBrainRetrieval(nn.Module):
             return torch.stack(max_vectors)  # [batch, 1, hidden_dim]
 
         elif self.pooling_strategy == 'mean':
+            window_units = getattr(self, 'eeg_window_units', 0)
+            test_crop_units = getattr(self, 'eeg_test_crop_units', 0)
+            if window_units or (test_crop_units and not self.training):
+                return self._windowed_mean(word_representations, eeg_padding_mask, window_units, test_crop_units)
             # Mean pooling over EEG word representations
             mean_vectors = []
             for i in range(batch_size):
@@ -417,6 +421,29 @@ class SimplifiedBrainRetrieval(nn.Module):
             # Extract CLS token representation
             pooled_vectors = attended_sequence[:, 0:1, :]  # [batch, 1, hidden_dim]
             return pooled_vectors
+
+    def _windowed_mean(self, word_representations, padding_mask, window_units, test_crop_units):
+        """Multiple-instance windows [batch, n_windows, dim], or test-time crop-averaged [batch, 1, dim]."""
+        outputs = []
+        for i in range(word_representations.size(0)):
+            active = word_representations[i, torch.where(~padding_mask[i])[0]]
+            if active.size(0) == 0:
+                active = torch.zeros(1, self.hidden_dim, device=word_representations.device)
+            length = active.size(0)
+            if window_units:
+                width = min(window_units, length)
+                stride = max(1, getattr(self, 'eeg_window_stride', 1))
+                outputs.append(torch.stack([active[s:s + width].mean(0)
+                                            for s in range(0, length - width + 1, stride)]))
+            else:
+                width = min(test_crop_units, length)
+                starts = torch.linspace(0, length - width, getattr(self, 'eeg_test_crops', 5)).round().long().unique()
+                crops = torch.stack([active[s:s + width].mean(0) for s in starts.tolist()])
+                outputs.append(crops.mean(0, keepdim=True))
+        n_windows = max(item.size(0) for item in outputs)
+        # Pad by repeating the first window; it cannot change the max-over-windows score.
+        return torch.stack([torch.cat([item, item[:1].expand(n_windows - item.size(0), -1)])
+                            for item in outputs])
 
     def forward(self, eeg_queries, text_queries, docs, eeg_mv_masks):
         """
@@ -828,6 +855,14 @@ def compute_multi_vector_similarity(query_vectors, doc_vectors, temperature=1.0)
         raise ValueError("Multi-vector similarity requires list input")
 
 
+def _cosine_or_window_max(q_vec, d_vec):
+    """Cosine similarity; for [n_windows, dim] queries, the best-matching window's similarity."""
+    d_norm = F.normalize(d_vec, p=2, dim=-1)
+    if q_vec.dim() == 2:
+        return (F.normalize(q_vec, p=2, dim=-1) @ d_norm).max()
+    return torch.dot(F.normalize(q_vec, p=2, dim=0), d_norm)
+
+
 def compute_cls_similarity(query_vectors, doc_vectors, temperature=1.0):
     """Compute cosine similarity for CLS tokens"""
 
@@ -837,15 +872,9 @@ def compute_cls_similarity(query_vectors, doc_vectors, temperature=1.0):
 
         for i in range(len(query_vectors)):
             # Extract vectors (remove singleton dimensions if needed)
-            q_vec = query_vectors[i].squeeze()  # [hidden_dim]
+            q_vec = query_vectors[i].squeeze()  # [hidden_dim] or [n_windows, hidden_dim]
             d_vec = doc_vectors[i].squeeze()  # [hidden_dim]
-
-            # Normalize and compute cosine similarity
-            q_norm = F.normalize(q_vec, p=2, dim=0)
-            d_norm = F.normalize(d_vec, p=2, dim=0)
-
-            sim = torch.dot(q_norm, d_norm)
-            similarities.append(sim)
+            similarities.append(_cosine_or_window_max(q_vec, d_vec))
 
         return torch.stack(similarities) / temperature
     else:
@@ -855,15 +884,9 @@ def compute_cls_similarity(query_vectors, doc_vectors, temperature=1.0):
 
         for i in range(batch_size):
             # Extract vectors (remove singleton dimensions if needed)
-            q_vec = query_vectors[i].squeeze()  # [hidden_dim]
+            q_vec = query_vectors[i].squeeze()  # [hidden_dim] or [n_windows, hidden_dim]
             d_vec = doc_vectors[i].squeeze()  # [hidden_dim]
-
-            # Normalize and compute cosine similarity
-            q_norm = F.normalize(q_vec, p=2, dim=0)
-            d_norm = F.normalize(d_vec, p=2, dim=0)
-
-            sim = torch.dot(q_norm, d_norm)
-            similarities.append(sim)
+            similarities.append(_cosine_or_window_max(q_vec, d_vec))
 
         return torch.stack(similarities) / temperature
 

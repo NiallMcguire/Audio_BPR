@@ -901,6 +901,12 @@ class DynamicMaskingDataloader(Dataset):
 
         # Process EEG
         eeg_compact = sample['query_eeg']
+        crop_units = getattr(self, 'eeg_train_crop_units', None)
+        if crop_units:
+            length = eeg_compact.shape[0]
+            width = min(length, random.randint(crop_units[0], crop_units[1]))
+            start = random.randint(0, length - width)
+            eeg_compact = eeg_compact[start:start + width]
         eeg_full = np.zeros((self.global_max_words, self.global_max_time, self.global_max_channels), dtype=np.float32)
         eeg_full[:eeg_compact.shape[0]] = eeg_compact
         eeg_tensor = torch.from_numpy(eeg_full)

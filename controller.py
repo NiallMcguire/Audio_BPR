@@ -256,6 +256,16 @@ def main():
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient-norm clipping threshold')
     parser.add_argument('--min-epochs', type=int, default=0,
                         help='Do not early-stop before this many epochs')
+    parser.add_argument('--eeg-train-crop-units', type=int, nargs=2, default=None, metavar=('MIN', 'MAX'),
+                        help='Train on a random contiguous crop of MIN-MAX EEG units per sample')
+    parser.add_argument('--eeg-test-crop-units', type=int, default=0,
+                        help='At evaluation, average embeddings over crops of this many EEG units')
+    parser.add_argument('--eeg-test-crops', type=int, default=5, help='Number of evaluation crops')
+    parser.add_argument('--eeg-window-units', type=int, default=0,
+                        help='Multiple-instance retrieval: score by best sliding window of this many units')
+    parser.add_argument('--eeg-window-stride', type=int, default=1, help='Sliding-window stride in units')
+    parser.add_argument('--init-checkpoint', type=str, default=None,
+                        help='Initialise model weights from a saved checkpoint before training')
 
     # Masking arguments
     parser.add_argument('--training_masking_level', type=int, default=90,
@@ -418,6 +428,12 @@ def main():
         'multi_positive_loss': args.multi_positive_loss,
         'grad_clip': args.grad_clip,
         'min_epochs': args.min_epochs,
+        'eeg_train_crop_units': args.eeg_train_crop_units,
+        'eeg_test_crop_units': args.eeg_test_crop_units,
+        'eeg_test_crops': args.eeg_test_crops,
+        'eeg_window_units': args.eeg_window_units,
+        'eeg_window_stride': args.eeg_window_stride,
+        'init_checkpoint': args.init_checkpoint,
         'max_eeg_len': args.max_eeg_len,
         'query_group_multi_positive': args.multi_positive_loss,
         'primary_task_source': 'authentic_query_response' if args.experiment_name else None,
@@ -481,6 +497,16 @@ def main():
         model.set_tokenizer_vocab_size(len(tokenizer))
     model.multi_positive_loss = args.multi_positive_loss
     model.grad_clip_norm = args.grad_clip
+    model.eeg_window_units = args.eeg_window_units
+    model.eeg_window_stride = args.eeg_window_stride
+    model.eeg_test_crop_units = args.eeg_test_crop_units
+    model.eeg_test_crops = args.eeg_test_crops
+    if args.eeg_train_crop_units:
+        train_dataloader.dataset.eeg_train_crop_units = tuple(args.eeg_train_crop_units)
+    if args.init_checkpoint:
+        checkpoint = torch.load(args.init_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Initialised model from {args.init_checkpoint}")
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())

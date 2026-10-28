@@ -16,6 +16,24 @@ TYPING_V2_SETTINGS = {"learning_rate": 3e-5, "patience": 20, "min_epochs": 10, "
                       "max_eeg_len": 100, "primary_eval_source": "authentic_typing"}
 TYPING_V2_SEEDS = (42, 43, 44)
 TYPING_FORMATS = ("continuous", "keypress", "word")
+IMAGINING_SETTINGS = {"learning_rate": 3e-5, "patience": 20, "min_epochs": 10, "grad_clip": 5.0,
+                      "primary_eval_source": "authentic_imagining"}
+IMAGINING_TARGETS = ("response",)
+IMAGINING_ICT_VARIANTS = ("position", "pace", "random")
+READING_ARM_A_CHECKPOINT = (AUDIO_BPR_DIR / "prepared_experiments_20261022_audio_bpr_originalsplit" / "results"
+                            / "query_response_plus_question_ict" / "model_mean_dual.pt")
+# method -> (EEG format file, extra controller flags)
+IMAGINING_METHODS = {
+    "window": ("window", ()),
+    "crop": ("window", ("--eeg-train-crop-units", "2", "4")),
+    "cropavg": ("window", ("--eeg-train-crop-units", "2", "4", "--eeg-test-crop-units", "3",
+                            "--eeg-test-crops", "5")),
+    "transfer": ("window", ("--init-checkpoint", str(READING_ARM_A_CHECKPOINT))),
+    "mil": ("window", ("--eeg-window-units", "2", "--eeg-window-stride", "1")),
+    "pace": ("pace", ()),
+    "uniform": ("uniform", ()),
+    "shuffled": ("shuffled", ()),
+}
 EXPERIMENTS = (
     ("query_response_only", ("query_response",)),
     ("query_response_plus_question_ict", ("query_response", "question_ict")),
@@ -40,6 +58,15 @@ EXPERIMENTS = (
       for fmt in TYPING_FORMATS
       for suffix, extra in (("_audio", ("audio",)), ("_visual", ("visual",)),
                             ("_audio_visual", ("audio", "visual")))),
+    *((f"imagining_{method}_{target}", (f"imagining_{fmt}_{target}",),
+       {**IMAGINING_SETTINGS, "extra_args": extra})
+      for method, (fmt, extra) in IMAGINING_METHODS.items() for target in IMAGINING_TARGETS),
+    *((f"imagining_arm_a_ict_{variant}", ("imagining_window_response", f"imagining_ict_{variant}"),
+       IMAGINING_SETTINGS) for variant in IMAGINING_ICT_VARIANTS),
+    *((f"imagining_arm_{arm}", ("imagining_window_response", "imagining_ict_position", *extra),
+       {**IMAGINING_SETTINGS, "balance_sources": True})
+      for arm, extra in (("b_audio", ("audio",)), ("c_visual", ("visual",)),
+                         ("d_audio_visual", ("audio", "visual")))),
 )
 READING_TASK_SOURCES = {"query_response", "question_ict", "response_ict"}
 
@@ -57,6 +84,12 @@ def build_plan(audio_data: Path, visual_data: Path, task_data: Path,
         **{f"typing_{fmt}_{kind}": str(task_dir.parent / "authentic_typing_pairs"
                                         / f"authentic_typing_{fmt}_{kind}_pairs.npy")
            for fmt in TYPING_FORMATS for kind in ("query_response", "ict", "question_ict")},
+        **{f"imagining_{fmt}_{target}": str(task_dir.parent / "authentic_imagining_pairs"
+                                             / f"authentic_imagining_{fmt}_{target}_pairs.npy")
+           for fmt in ("window", "pace", "uniform", "shuffled") for target in IMAGINING_TARGETS},
+        **{f"imagining_ict_{variant}": str(task_dir.parent / "authentic_imagining_pairs"
+                                           / f"authentic_imagining_ict_{variant}_question_pairs.npy")
+           for variant in IMAGINING_ICT_VARIANTS},
     }
     selected_names = set(experiment_names) if experiment_names is not None else None
     plan = []
@@ -120,6 +153,7 @@ def _controller_command(experiment: dict, output_path: Path, python_executable: 
         command.extend(["--primary-eval-source", overrides["primary_eval_source"]])
     if overrides.get("balance_sources") and len(paths) > 1:
         command.append("--balance_sources")
+    command.extend(overrides.get("extra_args", ()))
     command.append("--multi-positive-loss")
     if use_pretrained_text:
         command.append("--use_pretrained_text")

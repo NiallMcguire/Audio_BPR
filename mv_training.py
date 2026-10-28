@@ -975,7 +975,7 @@ def split_validation_data_by_dataset(val_dataloader):
 
             # More robust dataset name extraction
             if dataset_source.lower() in {'authentic_question_ict', 'authentic_response_ict'} \
-                    or dataset_source.lower().startswith('authentic_typing_'):
+                    or dataset_source.lower().startswith(('authentic_typing_', 'authentic_imagining_')):
                 dataset_name = dataset_source.lower()
             elif 'nieuwland' in dataset_source.lower():
                 dataset_name = 'nieuwland'
@@ -1177,9 +1177,9 @@ def rank_dual_encoder_subset(model, eeg_query, eeg_mv_mask, doc_list, doc_indice
         doc_vectors_list = [doc_list[doc_idx]['cached_vectors'] for doc_idx in doc_indices]
 
         if model.pooling_strategy in ('cls', 'max', 'mean'):
-            query_norm = F.normalize(query_vectors.reshape(-1), p=2, dim=0)
+            query_norm = F.normalize(query_vectors.reshape(-1, query_vectors.size(-1)), p=2, dim=1)
             doc_matrix = F.normalize(torch.stack([vec.reshape(-1) for vec in doc_vectors_list]), p=2, dim=1)
-            similarity_values = (doc_matrix @ query_norm).tolist()
+            similarity_values = (doc_matrix @ query_norm.T).max(dim=1).values.tolist()
             scores = list(zip(doc_indices, similarity_values))
         else:
             scores = []

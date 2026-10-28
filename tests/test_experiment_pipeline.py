@@ -24,7 +24,7 @@ from Dataset.authentic_query_ict_reader import (
 from controller import (create_dataloaders, create_source_test_loaders,
                         select_primary_validation_loader)
 from mv_dataloader import compute_global_eeg_dimensions, load_combined_datasets
-from mv_models import create_model
+from mv_models import compute_similarity, create_model
 from mv_training import (build_document_database, build_expanded_candidate_database,
                          compute_contrastive_loss, compute_multi_positive_ranking_metrics,
                          evaluate_expanded_candidate_index, initialize_wandb,
@@ -361,7 +361,7 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
             )}
 
             for name, source_names, *_ in EXPERIMENTS:
-                if name.startswith("typing_"):
+                if name.startswith(("typing_", "imagining_")):
                     continue
                 selected_paths = [paths[source] for source in source_names]
                 pairs, metadata = load_combined_datasets(selected_paths)
@@ -531,6 +531,12 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
             for fmt in ("continuous", "keypress", "word"):
                 for kind in ("query_response", "ict", "question_ict"):
                     (typing_dir / f"authentic_typing_{fmt}_{kind}_pairs.npy").touch()
+            imagining_dir = root / "authentic_imagining_pairs"
+            imagining_dir.mkdir()
+            for fmt in ("window", "pace", "uniform", "shuffled"):
+                (imagining_dir / f"authentic_imagining_{fmt}_response_pairs.npy").touch()
+            for variant in ("position", "pace", "random"):
+                (imagining_dir / f"authentic_imagining_ict_{variant}_question_pairs.npy").touch()
             (task_dir / "authentic_task_expanded_eval_index.json").write_text(json.dumps({
                 "candidate_count": 2,
                 "candidate_documents": [],
@@ -564,6 +570,32 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                 self.assertNotIn("--holdout_subjects", script.read_text())
                 self.assertNotIn("--train-sources", script.read_text())
                 text = script.read_text()
+                imagining_flags = ("--eeg-train-crop-units", "--eeg-test-crop-units", "--eeg-window-units",
+                                   "--init-checkpoint")
+                if script.stem.startswith("imagining_"):
+                    for flag in ("--lr 3e-05", "--patience 20", "--min-epochs 10", "--grad-clip 5.0",
+                                 "--primary-eval-source authentic_imagining"):
+                        self.assertIn(flag, text)
+                    self.assertNotIn("--expanded-eval-index", text)
+                    if script.stem.startswith("imagining_arm_"):
+                        self.assertIn("authentic_imagining_window_response_pairs.npy", text)
+                        variant = script.stem.rsplit("_", 1)[1] if "_a_ict_" in script.stem else "position"
+                        self.assertIn(f"authentic_imagining_ict_{variant}_question_pairs.npy", text)
+                        self.assertEqual("--balance_sources" in text, "_a_ict_" not in script.stem)
+                        for flag in imagining_flags:
+                            self.assertNotIn(flag, text)
+                        continue
+                    method, target = script.stem.split("_")[1:3]
+                    self.assertEqual(target, "response")
+                    fmt = method if method in ("pace", "uniform", "shuffled") else "window"
+                    self.assertIn(f"authentic_imagining_{fmt}_{target}_pairs.npy", text)
+                    self.assertEqual("--eeg-train-crop-units 2 4" in text, method in ("crop", "cropavg"))
+                    self.assertEqual("--eeg-test-crop-units 3" in text, method == "cropavg")
+                    self.assertEqual("--eeg-window-units 2" in text, method == "mil")
+                    self.assertEqual("--init-checkpoint" in text, method == "transfer")
+                    continue
+                for flag in imagining_flags:
+                    self.assertNotIn(flag, text)
                 if script.stem.startswith("typing_v2_"):
                     fmt = script.stem.split("_")[2]
                     for flag in ("--lr 3e-05", "--patience 20", "--min-epochs 10", "--grad-clip 5.0",
@@ -670,6 +702,34 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
             self.assertFalse(groups[0] & groups[1])
             self.assertFalse(groups[0] & groups[2])
             self.assertFalse(groups[1] & groups[2])
+
+    def test_imagining_window_and_crop_pooling(self):
+        model = create_model(hidden_dim=8, eeg_arch="simple", device="cpu", use_lora=False,
+                             pooling_strategy="mean", encoder_type="dual", global_eeg_dims=(10, 8, 2),
+                             query_type="eeg", use_pretrained_text=False)
+        model.eval()
+        eeg = torch.randn(3, 10, 8, 2)
+        eeg[2, 6:] = 0
+        mask = torch.ones(3, 32)
+        with torch.no_grad():
+            default = model.encode_eeg(eeg, mask)
+            self.assertEqual(tuple(default.shape), (3, 1, 8))
+            model.eeg_window_units, model.eeg_window_stride = 2, 1
+            windows = model.encode_eeg(eeg, mask)
+            self.assertEqual(tuple(windows.shape), (3, 9, 8))
+            docs = torch.randn(3, 1, 8)
+            similarity = compute_similarity([windows[0:1]], [docs[0:1]], "mean")[0]
+            expected = (torch.nn.functional.normalize(windows[0], dim=-1)
+                        @ torch.nn.functional.normalize(docs[0, 0], dim=0)).max()
+            self.assertAlmostEqual(similarity.item(), expected.item(), places=5)
+            loss, _ = compute_contrastive_loss(windows, docs, "mean")
+            self.assertTrue(torch.isfinite(loss).item())
+            model.eeg_window_units, model.eeg_test_crop_units, model.eeg_test_crops = 0, 3, 5
+            cropped = model.encode_eeg(eeg, mask)
+            self.assertEqual(tuple(cropped.shape), (3, 1, 8))
+            self.assertFalse(torch.allclose(cropped, default))
+            model.eeg_test_crop_units = 0
+            self.assertTrue(torch.allclose(model.encode_eeg(eeg, mask), default))
 
     def test_multi_positive_loss_does_not_penalize_duplicate_targets(self):
         query_vectors = torch.tensor([[[1.0, 0.0]], [[1.0, 0.0]], [[0.0, 1.0]]])
