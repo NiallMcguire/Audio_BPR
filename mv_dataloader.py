@@ -902,7 +902,8 @@ class DynamicMaskingDataloader(Dataset):
         # Process EEG
         eeg_compact = sample['query_eeg']
         crop_units = getattr(self, 'eeg_train_crop_units', None)
-        if crop_units:
+        crop_prefix = getattr(self, 'eeg_crop_sources', None)
+        if crop_units and (not crop_prefix or str(sample['dataset_source']).startswith(crop_prefix)):
             length = eeg_compact.shape[0]
             width = min(length, random.randint(crop_units[0], crop_units[1]))
             start = random.randint(0, length - width)

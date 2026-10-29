@@ -34,6 +34,9 @@ IMAGINING_METHODS = {
     "uniform": ("uniform", ()),
     "shuffled": ("shuffled", ()),
 }
+IMAGINING_V3 = {**IMAGINING_SETTINGS, "split_strategy": "trial", "split_seed": 42}
+IMAGINING_A = ("imagining_window_response", "imagining_ict_position")
+IMAGINING_EXTERNAL = (("b_audio", ("audio",)), ("c_visual", ("visual",)), ("d_audio_visual", ("audio", "visual")))
 EXPERIMENTS = (
     ("query_response_only", ("query_response",)),
     ("query_response_plus_question_ict", ("query_response", "question_ict")),
@@ -67,6 +70,36 @@ EXPERIMENTS = (
        {**IMAGINING_SETTINGS, "balance_sources": True})
       for arm, extra in (("b_audio", ("audio",)), ("c_visual", ("visual",)),
                          ("d_audio_visual", ("audio", "visual")))),
+    # Imagining v3 (next steps): trial-grouped split so a trial's crops and full window share a split.
+    *((f"imagining_v3_arm_a_ict_{variant}", ("imagining_window_response", f"imagining_ict_{variant}"),
+       IMAGINING_V3) for variant in IMAGINING_ICT_VARIANTS),
+    *((f"imagining_v3_arm_{arm}", (*IMAGINING_A, *extra), {**IMAGINING_V3, "balance_sources": True})
+      for arm, extra in IMAGINING_EXTERNAL),
+    ("reading_arm_a_trialsplit", ("query_response", "question_ict"),
+     {"split_strategy": "trial", "split_seed": 42}),
+    ("imagining_v3_arm_a_long", IMAGINING_A,
+     {**IMAGINING_V3, "balance_sources": True, "epochs": 150, "min_epochs": 150}),
+    *((f"imagining_v3_arm_{arm}_seed{seed}", (*IMAGINING_A, *extra),
+       {**IMAGINING_V3, "balance_sources": True, "seed": seed})
+      for arm, extra in IMAGINING_EXTERNAL[:2] for seed in (43, 44)),
+    ("imagining_v3_arm_a_reading_transfer", IMAGINING_A,
+     {**IMAGINING_V3, "extra_args": ("--init-checkpoint", str(READING_ARM_A_CHECKPOINT))}),
+    ("imagining_v3_arm_a_nieuwland_transfer", IMAGINING_A,
+     {**IMAGINING_V3, "extra_args": ("--eeg-unit-shape", "513", "64"),
+      "pretrain": {"sources": ("visual",), "overrides": {"extra_args": ("--eeg-unit-shape", "513", "64")}}}),
+    *((f"imagining_v3_c_{method}", (main, "imagining_ict_position", "visual"),
+       {**IMAGINING_V3, "balance_sources": True, "extra_args": extra})
+      for method, main, extra in (
+          ("crop", "imagining_window_response",
+           ("--eeg-train-crop-units", "2", "4", "--eeg-crop-sources", "authentic_imagining_window")),
+          ("cropavg", "imagining_window_response",
+           ("--eeg-train-crop-units", "2", "4", "--eeg-crop-sources", "authentic_imagining_window",
+            "--eeg-test-crop-units", "3", "--eeg-test-crops", "5")),
+          ("mil", "imagining_window_response", ("--eeg-window-units", "2", "--eeg-window-stride", "1")),
+          ("pace", "imagining_pace_response", ()),
+          ("uniform", "imagining_uniform_response", ()),
+          ("shuffled", "imagining_shuffled_response", ()),
+          ("combined_targets", "imagining_window_response", ("--question-as-positive",)))),
 )
 READING_TASK_SOURCES = {"query_response", "question_ict", "response_ict"}
 
@@ -96,8 +129,14 @@ def build_plan(audio_data: Path, visual_data: Path, task_data: Path,
     for name, source_names, *rest in EXPERIMENTS:
         if selected_names is not None and name not in selected_names:
             continue
-        plan.append({"name": name, "sources": list(source_names), "split_strategy": "original",
-                     "overrides": dict(rest[0]) if rest else {},
+        overrides = dict(rest[0]) if rest else {}
+        pretrain = overrides.get("pretrain")
+        plan.append({"name": name, "sources": list(source_names),
+                     "split_strategy": overrides.get("split_strategy", "original"),
+                     "overrides": overrides,
+                     **({"pretrain": {"sources": list(pretrain["sources"]),
+                                      "data_paths": [sources[source] for source in pretrain["sources"]],
+                                      "overrides": dict(pretrain.get("overrides", {}))}} if pretrain else {}),
                      "expanded_eval_index": (expanded_eval_index
                                              if READING_TASK_SOURCES & set(source_names) else None),
                      "data_paths": [sources[source] for source in source_names]})
@@ -115,6 +154,7 @@ def _controller_command(experiment: dict, output_path: Path, python_executable: 
     seed = overrides.get("seed", seed)
     patience = overrides.get("patience", patience)
     learning_rate = overrides.get("learning_rate", learning_rate)
+    epochs = overrides.get("epochs", epochs)
     paths = experiment["data_paths"]
     if len(paths) == 1:
         command.extend(["--data_path", paths[0]])
@@ -140,9 +180,11 @@ def _controller_command(experiment: dict, output_path: Path, python_executable: 
         *(["--expanded-eval-index", experiment["expanded_eval_index"]]
           if experiment["expanded_eval_index"] else []),
         "--wandb-project", wandb_project,
-        "--wandb-run-name", f"aqbpr_{experiment['name']}_mean_seed{seed}_originalsplit",
+        "--wandb-run-name", f"aqbpr_{experiment['name']}_mean_seed{seed}_{experiment['split_strategy']}split",
         "--split-strategy", experiment["split_strategy"],
     ])
+    if "split_seed" in overrides:
+        command.extend(["--split-seed", str(overrides["split_seed"])])
     if "grad_clip" in overrides:
         command.extend(["--grad-clip", str(overrides["grad_clip"])])
     if "min_epochs" in overrides:
@@ -162,12 +204,13 @@ def _controller_command(experiment: dict, output_path: Path, python_executable: 
     return command
 
 
-def _slurm_script(experiment: dict, command: list[str], output_dir: Path, partition: str,
+def _slurm_script(experiment: dict, command: list, output_dir: Path, partition: str,
                   time_limit: str, memory: str, cpus: int, gpu_request: str,
                   exclude_nodes: list[str] | None = None) -> str:
     log_dir = output_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    command_text = shlex.join(command)
+    commands = command if command and isinstance(command[0], list) else [command]
+    command_text = "\n".join(shlex.join(item) for item in commands)
     return "\n".join([
         "#!/bin/bash",
         f"#SBATCH --job-name=bpr-{experiment['name']}",
@@ -232,6 +275,14 @@ def prepare_jobs(audio_data: Path, visual_data: Path, task_data: Path, output_di
         command = _controller_command(experiment, experiment_output, python_executable, seed,
                           epochs, patience, batch_size, learning_rate, use_pretrained_text, use_lora,
                           pooling_strategy, wandb_project)
+        if "pretrain" in experiment:
+            pretrain_output = experiment_output / "pretrain"
+            pretrain = {"name": f"{experiment['name']}_pretrain", "split_strategy": "original",
+                        "expanded_eval_index": None, **experiment["pretrain"]}
+            command = [_controller_command(pretrain, pretrain_output, python_executable, seed, epochs, patience,
+                                           batch_size, learning_rate, use_pretrained_text, use_lora,
+                                           pooling_strategy, wandb_project),
+                       [*command, "--init-checkpoint", str(pretrain_output / f"model_{pooling_strategy}_dual.pt")]]
         script_path = jobs_dir / f"{experiment['name']}.sbatch"
         script_path.write_text(_slurm_script(experiment, command, output_dir, partition,
                                              time_limit, memory, cpus, gpu_request, exclude_nodes), encoding="utf-8")

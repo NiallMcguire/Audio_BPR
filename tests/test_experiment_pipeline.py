@@ -566,17 +566,37 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                 self.assertIn("--no_lora", script.read_text())
                 self.assertIn("--multi-positive-loss", script.read_text())
                 self.assertIn("--wandb-project 'Authentic Queries BPR'", script.read_text())
-                self.assertIn("--split-strategy original", script.read_text())
+                trial_arm = script.stem.startswith("imagining_v3_") or script.stem == "reading_arm_a_trialsplit"
+                self.assertIn(f"--split-strategy {'trial' if trial_arm else 'original'}", script.read_text())
+                self.assertEqual("--split-seed 42" in script.read_text(), trial_arm)
                 self.assertNotIn("--holdout_subjects", script.read_text())
                 self.assertNotIn("--train-sources", script.read_text())
                 text = script.read_text()
                 imagining_flags = ("--eeg-train-crop-units", "--eeg-test-crop-units", "--eeg-window-units",
                                    "--init-checkpoint")
                 if script.stem.startswith("imagining_"):
-                    for flag in ("--lr 3e-05", "--patience 20", "--min-epochs 10", "--grad-clip 5.0",
+                    for flag in ("--lr 3e-05", "--patience 20", "--min-epochs", "--grad-clip 5.0",
                                  "--primary-eval-source authentic_imagining"):
                         self.assertIn(flag, text)
                     self.assertNotIn("--expanded-eval-index", text)
+                    if script.stem.startswith("imagining_v3_"):
+                        self.assertIn("authentic_imagining_ict_", text)
+                        self.assertEqual("--eeg-window-units 2" in text, script.stem == "imagining_v3_c_mil")
+                        self.assertEqual("--question-as-positive" in text,
+                                         script.stem == "imagining_v3_c_combined_targets")
+                        self.assertEqual("--eeg-crop-sources authentic_imagining_window" in text,
+                                         script.stem in ("imagining_v3_c_crop", "imagining_v3_c_cropavg"))
+                        if script.stem == "imagining_v3_arm_a_nieuwland_transfer":
+                            lines = [line for line in text.splitlines() if "controller.py" in line]
+                            self.assertEqual(len(lines), 2)
+                            self.assertIn("nieuwland_ict_pairs.npy", lines[0])
+                            self.assertIn("--eeg-unit-shape 513 64", lines[0])
+                            self.assertIn("pretrain/model_mean_dual.pt", lines[1])
+                        if script.stem == "imagining_v3_arm_a_long":
+                            self.assertIn("--epochs 150", text)
+                            self.assertIn("--min-epochs 150", text)
+                        continue
+                    self.assertIn("--min-epochs 10", text)
                     if script.stem.startswith("imagining_arm_"):
                         self.assertIn("authentic_imagining_window_response_pairs.npy", text)
                         variant = script.stem.rsplit("_", 1)[1] if "_a_ict_" in script.stem else "position"
@@ -621,7 +641,7 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                 else:
                     self.assertIn("--expanded-eval-index", text)
                     self.assertIn("authentic_query_response_aligned_pairs.npy", text)
-                self.assertIn("_originalsplit", text)
+                self.assertRegex(text, r"_(original|trial)split")
                 self.assertIn("--wandb-run-name aqbpr_", script.read_text())
             self.assertEqual(report["text_encoder_policy"], "pretrained ColBERT frozen (LoRA disabled)")
             self.assertIn("No jobs were submitted", (prepared / "PREPARED_NOT_SUBMITTED.txt").read_text())

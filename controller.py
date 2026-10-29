@@ -66,7 +66,8 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
                        train_ratio, holdout_subjects, training_masking_level,
                        global_eeg_dims=None, combined_dataset=None,
                        pair_split_seed=42, balance_sources=False,
-                       split_strategy='pair', train_sources=None):
+                       split_strategy='pair', train_sources=None, eeg_unit_shape=None,
+                       question_positive=False):
     """Create training, validation, and test dataloaders"""
 
     # Load each source once. Reopening a very large .npy three times for train,
@@ -81,6 +82,17 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
             global_eeg_dims = compute_combined_eeg_dimensions(all_pairs, max_eeg_len)
     elif global_eeg_dims is None:
         global_eeg_dims = compute_combined_eeg_dimensions(combined_dataset['ict_pairs'], max_eeg_len)
+    if eeg_unit_shape:
+        # A fixed unit shape lets weights transfer between datasets with different EEG unit sizes.
+        global_eeg_dims = (global_eeg_dims[0], max(global_eeg_dims[1], eeg_unit_shape[0]),
+                           max(global_eeg_dims[2], eeg_unit_shape[1]))
+    if question_positive:
+        for pair in combined_dataset['ict_pairs']:
+            source = str(pair.get('dataset_source', ''))
+            if source.startswith('authentic_imagining_') and source.endswith('_response') \
+                    and pair.get('question_document_id'):
+                pair['positive_document_ids'] = [pair['question_document_id'],
+                                                 *pair.get('positive_document_ids', [])]
     print(f"Computed shared EEG dimensions: {global_eeg_dims[0]}x{global_eeg_dims[1]}x{global_eeg_dims[2]}")
 
     training_masking_prob = training_masking_level / 100.0
@@ -266,6 +278,14 @@ def main():
     parser.add_argument('--eeg-window-stride', type=int, default=1, help='Sliding-window stride in units')
     parser.add_argument('--init-checkpoint', type=str, default=None,
                         help='Initialise model weights from a saved checkpoint before training')
+    parser.add_argument('--split-seed', type=int, default=None,
+                        help='Seed for hashed splits (default: --seed); fix it to keep splits equal across seeds')
+    parser.add_argument('--eeg-unit-shape', type=int, nargs=2, default=None, metavar=('SAMPLES', 'CHANNELS'),
+                        help='Pad every EEG unit to this shape so weights transfer across datasets')
+    parser.add_argument('--question-as-positive', action='store_true',
+                        help='Imagined->response pairs also treat the displayed question as a positive')
+    parser.add_argument('--eeg-crop-sources', type=str, default=None,
+                        help='Only crop training samples whose dataset_source starts with this prefix')
 
     # Masking arguments
     parser.add_argument('--training_masking_level', type=int, default=90,
@@ -386,10 +406,12 @@ def main():
         training_masking_level=args.training_masking_level,
         global_eeg_dims=global_eeg_dims,
         combined_dataset=combined_dataset,
-        pair_split_seed=args.seed,
+        pair_split_seed=args.seed if args.split_seed is None else args.split_seed,
         balance_sources=args.balance_sources,
         split_strategy=args.split_strategy,
         train_sources=args.train_sources,
+        eeg_unit_shape=args.eeg_unit_shape,
+        question_positive=args.question_as_positive,
     )
 
     training_val_dataloader = val_dataloader
@@ -434,6 +456,10 @@ def main():
         'eeg_window_units': args.eeg_window_units,
         'eeg_window_stride': args.eeg_window_stride,
         'init_checkpoint': args.init_checkpoint,
+        'split_seed': args.split_seed,
+        'eeg_unit_shape': args.eeg_unit_shape,
+        'question_as_positive': args.question_as_positive,
+        'eeg_crop_sources': args.eeg_crop_sources,
         'max_eeg_len': args.max_eeg_len,
         'query_group_multi_positive': args.multi_positive_loss,
         'primary_task_source': 'authentic_query_response' if args.experiment_name else None,
@@ -503,6 +529,7 @@ def main():
     model.eeg_test_crops = args.eeg_test_crops
     if args.eeg_train_crop_units:
         train_dataloader.dataset.eeg_train_crop_units = tuple(args.eeg_train_crop_units)
+        train_dataloader.dataset.eeg_crop_sources = args.eeg_crop_sources
     if args.init_checkpoint:
         checkpoint = torch.load(args.init_checkpoint, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
