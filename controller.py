@@ -18,7 +18,8 @@ from datetime import datetime
 # Import custom modules
 from mv_dataloader import (DynamicMaskingDataloader, simple_collate_fn,
                            compute_combined_eeg_dimensions, load_combined_datasets)
-from mv_models import create_model
+from mv_models import EEG_POOLING_CHOICES, create_model
+from fm_encoders import FINETUNE_MODES, FM_SPECS, FMInputAdapter
 from mv_training import train_model, test_model, finish_wandb, evaluate_expanded_candidate_index
 import wandb
 
@@ -67,7 +68,7 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
                        global_eeg_dims=None, combined_dataset=None,
                        pair_split_seed=42, balance_sources=False,
                        split_strategy='pair', train_sources=None, eeg_unit_shape=None,
-                       question_positive=False):
+                       question_positive=False, fm_adapter=None):
     """Create training, validation, and test dataloaders"""
 
     # Load each source once. Reopening a very large .npy three times for train,
@@ -131,6 +132,12 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
         initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed,
         split_strategy=split_strategy
     )
+    if fm_adapter is not None:
+        for dataset in (train_dataset, val_dataset, test_dataset):
+            dataset.fm_adapter = fm_adapter
+        global_eeg_dims = (global_eeg_dims[0], fm_adapter.n_times, fm_adapter.n_channels)
+        print(f"Foundation-model input: {fm_adapter.n_channels} channels x {fm_adapter.n_times} samples "
+              f"at {fm_adapter.sfreq} Hz per unit")
 
     train_sampler = None
     train_sources = [pair.get('dataset_source', 'unknown') for pair in train_dataset.processed_pairs]
@@ -229,6 +236,23 @@ def save_test_metrics(path, results):
     path.write_text(json.dumps(results, indent=2, default=float) + '\n', encoding='utf-8')
 
 
+def save_eeg_attention_weights(model, dataloader, device, path):
+    """Write each test query's attention-pooling weight per EEG unit, with its trial metadata."""
+    keys = ('dataset_source', 'participant_id', 'session_id', 'part', 'trial', 'question_id',
+            'query_kind', 'document_id', 'original_idx')
+    rows = []
+    model.eval()
+    with torch.no_grad():
+        for batch in dataloader:
+            eeg = batch['eeg_queries'].to(device)
+            model.encode_eeg(eeg, batch['eeg_mv_masks'].to(device))
+            n_units = (eeg.abs().sum(dim=(2, 3)) > 0).sum(dim=1).tolist()
+            for weights, count, meta in zip(model.last_eeg_attention.cpu().tolist(), n_units, batch['metadata']):
+                rows.append({**{key: meta.get(key, '') for key in keys}, 'n_units': count,
+                             'weights': [round(w, 6) for w in weights[:count]]})
+    path.write_text(json.dumps(rows) + '\n', encoding='utf-8')
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Brain Passage Retrieval - Paper Reproduction')
@@ -259,8 +283,10 @@ def main():
                         help='Use subject-based train/val/test split')
     parser.add_argument('--balance_sources', action='store_true',
                         help='Sample mixed-source training pairs with equal source probability')
-    parser.add_argument('--split-strategy', choices=('pair', 'target', 'trial', 'original'), default='pair',
-                        help='Pair-level, target-grouped, Task trial-grouped, or original Audio BPR random split')
+    parser.add_argument('--split-strategy', choices=('pair', 'target', 'trial', 'original', 'original_fixed'),
+                        default='pair',
+                        help='Pair-level, target-grouped, Task trial-grouped, original Audio BPR random split, '
+                             'or the original split applied per source (fixed task test set across arms)')
     parser.add_argument('--train-sources', nargs='+', default=None,
                         help='dataset_source values used for training; val/test keep all loaded sources')
     parser.add_argument('--multi-positive-loss', action='store_true',
@@ -286,6 +312,9 @@ def main():
                         help='Imagined->response pairs also treat the displayed question as a positive')
     parser.add_argument('--eeg-crop-sources', type=str, default=None,
                         help='Only crop training samples whose dataset_source starts with this prefix')
+    parser.add_argument('--best-checkpoint-copy', action='store_true',
+                        help='Keep a real copy of the best-epoch weights and test that model '
+                             '(default keeps the original shallow copy, i.e. the final epoch)')
 
     # Masking arguments
     parser.add_argument('--training_masking_level', type=int, default=90,
@@ -320,8 +349,17 @@ def main():
     parser.add_argument('--hidden_dim', type=int, default=768, help='Hidden dimension size')
     parser.add_argument('--num_vectors', type=int, default=32, help='Number of vectors for multi pooling')
     parser.add_argument('--eeg_arch', type=str, default='simple',
-                        choices=['simple', 'complex', 'transformer'],
-                        help='EEG encoder architecture')
+                        choices=['simple', 'complex', 'transformer', *FM_SPECS],
+                        help='EEG encoder architecture (simple MLP, or a pretrained foundation model)')
+    parser.add_argument('--eeg-pooling', type=str, default=None, choices=EEG_POOLING_CHOICES,
+                        help='EEG unit pooling (default: --pooling_strategy); text pooling is unchanged')
+    parser.add_argument('--fm-finetune', choices=FINETUNE_MODES, default='frozen',
+                        help='Foundation model: frozen backbone, top blocks unfrozen, or full fine-tuning')
+    parser.add_argument('--fm-unfreeze-blocks', type=int, default=2,
+                        help='Transformer blocks unfrozen with --fm-finetune top')
+    parser.add_argument('--fm-amp', action='store_true', help='Run the foundation model in bfloat16 autocast')
+    parser.add_argument('--fm-chunk-size', type=int, default=1024,
+                        help='EEG units per foundation-model forward chunk')
     parser.add_argument('--colbert_model_name', type=str, default='colbert-ir/colbertv2.0',
                         help='ColBERT model name')
     parser.add_argument('--no_lora', action='store_true', help='Disable LoRA adaptation')
@@ -395,6 +433,7 @@ def main():
 
     # Create dataloaders
     print(f"\n=== CREATING DATALOADERS ===")
+    fm_adapter = FMInputAdapter(args.eeg_arch) if args.eeg_arch in FM_SPECS else None
     train_dataloader, val_dataloader, test_dataloader, global_eeg_dims = create_dataloaders(
         data_path=data_path,
         tokenizer=tokenizer,
@@ -412,6 +451,7 @@ def main():
         train_sources=args.train_sources,
         eeg_unit_shape=args.eeg_unit_shape,
         question_positive=args.question_as_positive,
+        fm_adapter=fm_adapter,
     )
 
     training_val_dataloader = val_dataloader
@@ -460,6 +500,7 @@ def main():
         'eeg_unit_shape': args.eeg_unit_shape,
         'question_as_positive': args.question_as_positive,
         'eeg_crop_sources': args.eeg_crop_sources,
+        'best_checkpoint_copy': args.best_checkpoint_copy,
         'max_eeg_len': args.max_eeg_len,
         'query_group_multi_positive': args.multi_positive_loss,
         'primary_task_source': 'authentic_query_response' if args.experiment_name else None,
@@ -482,6 +523,14 @@ def main():
         'all_source_val_samples': len(val_dataloader.dataset),
         'test_samples': len(test_dataloader.dataset),
         'eeg_arch': args.eeg_arch,
+        'eeg_pooling': args.eeg_pooling or args.pooling_strategy,
+        'fm_finetune': args.fm_finetune if fm_adapter else None,
+        'fm_unfreeze_blocks': args.fm_unfreeze_blocks if fm_adapter else None,
+        'fm_amp': args.fm_amp if fm_adapter else None,
+        'fm_repo': FM_SPECS[args.eeg_arch]['repo'] if fm_adapter else None,
+        'fm_input': ({'sfreq': fm_adapter.sfreq, 'n_times': fm_adapter.n_times,
+                      'channels': [a if b is None else f'{a}-{b}' for a, b in fm_adapter.layout]}
+                     if fm_adapter else None),
         'data_files': [Path(path).name for path in (args.data_paths or [args.data_path])],
         'hidden_dim': args.hidden_dim,
         'num_vectors': args.num_vectors,
@@ -516,7 +565,10 @@ def main():
         encoder_type=args.encoder_type,
         global_eeg_dims=global_eeg_dims,
         query_type=args.query_type,
-        use_pretrained_text=args.use_pretrained_text
+        use_pretrained_text=args.use_pretrained_text,
+        eeg_pooling=args.eeg_pooling,
+        fm_options=({'finetune': args.fm_finetune, 'unfreeze_blocks': args.fm_unfreeze_blocks,
+                     'use_amp': args.fm_amp, 'chunk_size': args.fm_chunk_size} if fm_adapter else None),
     )
 
     if not args.use_pretrained_text:
@@ -599,6 +651,10 @@ def main():
                 wandb_namespace=f'test_by_source/{source}',
             )
             save_test_metrics(results_dir / f'{source}_metrics.json', source_results)
+
+        if getattr(trained_model, 'eeg_pooling', None) == 'attention':
+            save_eeg_attention_weights(trained_model, test_dataloader, device,
+                                       results_dir / 'eeg_attention_weights.json')
 
         task_test_loader = create_subset_loader(
             test_dataloader, lambda pair: pair.get('training_source') == 'authentic_query')

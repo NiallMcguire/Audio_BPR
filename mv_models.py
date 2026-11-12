@@ -12,6 +12,10 @@ import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model, TaskType
 import math
 
+from fm_encoders import FM_SPECS, FoundationUnitEncoder
+
+EEG_POOLING_CHOICES = ('multi', 'cls', 'max', 'mean', 'attention')
+
 
 class SimpleTextEncoder(nn.Module):
     """Simple text encoder trained from scratch (similar complexity to EEG encoder)"""
@@ -84,20 +88,29 @@ class SimplifiedBrainRetrieval(nn.Module):
                  hidden_dim=768, eeg_arch='simple', dropout=0.1,
                  use_lora=True, lora_r=16, lora_alpha=32,
                  pooling_strategy='multi', query_type='eeg',
-                 use_pretrained_text=True, global_eeg_dims=None):
+                 use_pretrained_text=True, global_eeg_dims=None,
+                 eeg_pooling=None, fm_options=None):
         super().__init__()
 
         self.query_type = query_type
         self.pooling_strategy = pooling_strategy
+        # Text pooling and the similarity follow pooling_strategy; EEG pooling can differ.
+        self.eeg_pooling = eeg_pooling or pooling_strategy
+        self.fm_options = fm_options or {}
         self.hidden_dim = hidden_dim
         self.eeg_arch = eeg_arch
         self.use_lora = use_lora
         self.use_pretrained_text = use_pretrained_text
+        self.last_eeg_attention = None
 
         # Validate pooling strategy
         if pooling_strategy not in ['multi', 'cls', 'max', 'mean']:
             raise ValueError(
                 f"Only 'multi', 'cls', 'max', and 'mean' pooling strategies supported, got: {pooling_strategy}")
+        if self.eeg_pooling not in EEG_POOLING_CHOICES:
+            raise ValueError(f"EEG pooling must be one of {EEG_POOLING_CHOICES}, got {self.eeg_pooling}")
+        if (self.eeg_pooling == 'multi') != (pooling_strategy == 'multi'):
+            raise ValueError("Multi-vector EEG pooling needs multi-vector text pooling (and vice versa)")
         # Text encoder - either pretrained or simple from-scratch
         if use_pretrained_text:
             # Original pretrained approach
@@ -141,7 +154,12 @@ class SimplifiedBrainRetrieval(nn.Module):
 
         # FIXED: Initialize EEG encoder immediately if dimensions are provided
         # Create EEG encoder during initialization, not lazily
-        if global_eeg_dims is not None and query_type == 'eeg':
+        if eeg_arch in FM_SPECS and query_type == 'eeg':
+            self.eeg_encoder = FoundationUnitEncoder(eeg_arch, hidden_dim, **self.fm_options)
+            print(f"✓ Loaded pretrained {eeg_arch} ({self.eeg_encoder.finetune}; "
+                  f"{self.eeg_encoder.trainable_backbone_params:,} trainable backbone parameters; "
+                  f"{len(self.eeg_encoder.channel_names)} channels)")
+        elif global_eeg_dims is not None and query_type == 'eeg':
             num_words, time_samples, channels = global_eeg_dims
             input_size = time_samples * channels
             # Initialize on the model's current device; create_model moves the
@@ -162,7 +180,7 @@ class SimplifiedBrainRetrieval(nn.Module):
             self.eeg_projection = nn.Identity()  # No-op for transformer
 
         # Components for CLS pooling
-        if pooling_strategy == 'cls':
+        if self.eeg_pooling == 'cls':
             # Learnable CLS token for EEG sequences
             self.eeg_cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
 
@@ -177,6 +195,9 @@ class SimplifiedBrainRetrieval(nn.Module):
             )
             self.eeg_cls_transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
             print(f"Initialized learnable EEG CLS token: {self.eeg_cls_token.shape}")
+        if self.eeg_pooling == 'attention':
+            # Attention-based MIL pooling (Ilse et al., 2018): one learned weight per EEG unit.
+            self.eeg_attention = nn.Sequential(nn.Linear(hidden_dim, 128), nn.Tanh(), nn.Linear(128, 1))
 
         # Dropout for regularization
         self.dropout = nn.Dropout(dropout)
@@ -330,7 +351,14 @@ class SimplifiedBrainRetrieval(nn.Module):
         eeg_padding_mask = (eeg_input.abs().sum(dim=(2, 3)) == 0)  # [batch, num_words]
 
         # Encode EEG words
-        if self.eeg_arch == 'transformer':
+        if self.eeg_arch in FM_SPECS:
+            units = eeg_input.reshape(batch_size * num_words, time_samples, channels)
+            active = ~eeg_padding_mask.reshape(-1)
+            encoded = torch.zeros(batch_size * num_words, self.hidden_dim, device=eeg_input.device)
+            if active.any():
+                encoded[active] = self.eeg_encoder(units[active])
+            word_representations = encoded.view(batch_size, num_words, self.hidden_dim)
+        elif self.eeg_arch == 'transformer':
             eeg_reshaped = eeg_input.view(batch_size, num_words, input_size)
             # FIXED: Pass padding mask to transformer
             word_representations = self.eeg_encoder(eeg_reshaped, padding_mask=eeg_padding_mask)
@@ -343,7 +371,15 @@ class SimplifiedBrainRetrieval(nn.Module):
         word_representations = self.eeg_projection(word_representations)
         word_representations = self.dropout(word_representations)
 
-        if self.pooling_strategy == 'multi':
+        if self.eeg_pooling == 'attention':
+            scores = self.eeg_attention(word_representations).squeeze(-1)
+            scores = scores.masked_fill(eeg_padding_mask, float('-inf'))
+            # A query with no EEG units keeps a zero vector instead of NaN weights.
+            weights = torch.nan_to_num(torch.softmax(scores, dim=1))
+            self.last_eeg_attention = weights.detach()
+            return torch.bmm(weights.unsqueeze(1), word_representations)  # [batch, 1, hidden_dim]
+
+        if self.eeg_pooling == 'multi':
             # Multi-vector: use all valid EEG word representations
             multi_vectors = []
 
@@ -361,7 +397,7 @@ class SimplifiedBrainRetrieval(nn.Module):
 
             return multi_vectors
 
-        elif self.pooling_strategy == 'max':
+        elif self.eeg_pooling == 'max':
             # Max pooling over EEG word representations
             max_vectors = []
             for i in range(batch_size):
@@ -379,7 +415,7 @@ class SimplifiedBrainRetrieval(nn.Module):
 
             return torch.stack(max_vectors)  # [batch, 1, hidden_dim]
 
-        elif self.pooling_strategy == 'mean':
+        elif self.eeg_pooling == 'mean':
             window_units = getattr(self, 'eeg_window_units', 0)
             test_crop_units = getattr(self, 'eeg_test_crop_units', 0)
             if window_units or (test_crop_units and not self.training):
@@ -401,7 +437,7 @@ class SimplifiedBrainRetrieval(nn.Module):
 
             return torch.stack(mean_vectors)  # [batch, 1, hidden_dim]
 
-        elif self.pooling_strategy == 'cls':
+        elif self.eeg_pooling == 'cls':
             # CLS pooling: use learnable CLS token with attention
             cls_tokens = self.eeg_cls_token.expand(batch_size, -1, -1)  # [batch, 1, hidden_dim]
 
@@ -895,7 +931,7 @@ def create_model(colbert_model_name='colbert-ir/colbertv2.0', hidden_dim=768,
                  eeg_arch='simple', device='cuda', use_lora=True, lora_r=16,
                  lora_alpha=32, pooling_strategy='multi', encoder_type='dual',
                  global_eeg_dims=None, query_type='eeg',
-                 use_pretrained_text=True):
+                 use_pretrained_text=True, eeg_pooling=None, fm_options=None):
     """
     Create model with proper EEG encoder initialization
 
@@ -917,7 +953,9 @@ def create_model(colbert_model_name='colbert-ir/colbertv2.0', hidden_dim=768,
             pooling_strategy=pooling_strategy,
             query_type=query_type,
             use_pretrained_text=use_pretrained_text,
-            global_eeg_dims=global_eeg_dims  # FIXED: Pass global_eeg_dims
+            global_eeg_dims=global_eeg_dims,  # FIXED: Pass global_eeg_dims
+            eeg_pooling=eeg_pooling,
+            fm_options=fm_options,
         )
     elif encoder_type == 'cross':
         model = CrossEncoderBrainRetrieval(

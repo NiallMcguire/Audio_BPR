@@ -1826,7 +1826,11 @@ def train_model(model, train_dataloader, val_dataloader, optimizer, num_epochs,
             epochs_without_improvement = 0
 
             # Save best model state
-            best_model_state = model.state_dict().copy()
+            if (config or {}).get('best_checkpoint_copy'):
+                best_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            else:
+                # Original behaviour: a shallow dict copy, so the restored weights are the final epoch's.
+                best_model_state = model.state_dict().copy()
 
             print(f"New best validation loss: {best_val_loss:.4f} (epoch {epoch_num})")
         else:

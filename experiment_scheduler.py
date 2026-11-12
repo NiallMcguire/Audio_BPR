@@ -104,11 +104,9 @@ EXPERIMENTS = (
 READING_TASK_SOURCES = {"query_response", "question_ict", "response_ict"}
 
 
-def build_plan(audio_data: Path, visual_data: Path, task_data: Path,
-               experiment_names: list[str] | tuple[str, ...] | None = None) -> list[dict]:
+def source_paths(audio_data: Path, visual_data: Path, task_data: Path) -> dict:
     task_dir = Path(task_data).resolve().parent
-    expanded_eval_index = str(task_dir / "authentic_task_expanded_eval_index.json")
-    sources = {
+    return {
         "audio": str(Path(audio_data).resolve()),
         "visual": str(Path(visual_data).resolve()),
         "query_response": str(task_dir / "authentic_query_response_aligned_pairs.npy"),
@@ -124,6 +122,13 @@ def build_plan(audio_data: Path, visual_data: Path, task_data: Path,
                                            / f"authentic_imagining_ict_{variant}_question_pairs.npy")
            for variant in IMAGINING_ICT_VARIANTS},
     }
+
+
+def build_plan(audio_data: Path, visual_data: Path, task_data: Path,
+               experiment_names: list[str] | tuple[str, ...] | None = None) -> list[dict]:
+    task_dir = Path(task_data).resolve().parent
+    expanded_eval_index = str(task_dir / "authentic_task_expanded_eval_index.json")
+    sources = source_paths(audio_data, visual_data, task_data)
     selected_names = set(experiment_names) if experiment_names is not None else None
     plan = []
     for name, source_names, *rest in EXPERIMENTS:
@@ -206,7 +211,7 @@ def _controller_command(experiment: dict, output_path: Path, python_executable: 
 
 def _slurm_script(experiment: dict, command: list, output_dir: Path, partition: str,
                   time_limit: str, memory: str, cpus: int, gpu_request: str,
-                  exclude_nodes: list[str] | None = None) -> str:
+                  exclude_nodes: list[str] | None = None, environment: dict | None = None) -> str:
     log_dir = output_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     commands = command if command and isinstance(command[0], list) else [command]
@@ -225,6 +230,7 @@ def _slurm_script(experiment: dict, command: list, output_dir: Path, partition: 
         "set -euo pipefail",
         f"cd {shlex.quote(str(AUDIO_BPR_DIR))}",
         "export PYTHONUNBUFFERED=1",
+        *(f"export {key}={shlex.quote(str(value))}" for key, value in (environment or {}).items()),
         f"{command_text}",
         "",
     ])

@@ -13,6 +13,8 @@ import hashlib
 from typing import Dict, List, Optional, Tuple
 import warnings
 
+SPLIT_STRATEGIES = {'pair', 'target', 'trial', 'original', 'original_fixed'}
+
 
 def create_positive_negative_pairs(batch):
     """Create positive and negative pairs for BCE training"""
@@ -271,8 +273,8 @@ class DynamicMaskingDataloader(Dataset):
         self.fold = fold  # NEW: Store fold number
         self.pair_split_seed = pair_split_seed
         self.split_strategy = split_strategy
-        if split_strategy not in {'pair', 'target', 'trial', 'original'}:
-            raise ValueError(f"split_strategy must be 'pair', 'target', 'trial', or 'original', got {split_strategy}")
+        if split_strategy not in SPLIT_STRATEGIES:
+            raise ValueError(f"split_strategy must be one of {sorted(SPLIT_STRATEGIES)}, got {split_strategy}")
         if holdout_subjects and split_strategy != 'pair':
             raise ValueError(f"{split_strategy} split cannot be combined with holdout_subjects")
 
@@ -352,6 +354,8 @@ class DynamicMaskingDataloader(Dataset):
             if self.debug:
                 print("Using original Audio BPR random sample split")
             self.indices, self.unique_subjects = self._create_original_random_split(split, train_ratio)
+        elif split_strategy == 'original_fixed':
+            self.indices, self.unique_subjects = self._create_original_per_source_split(split, train_ratio)
         else:
             # Deterministic pair-level split within each source. This preserves
             # the same source test pairs when other datasets are added/removed.
@@ -431,6 +435,30 @@ class DynamicMaskingDataloader(Dataset):
         else:
             val_indices = shuffled_indices[split_idx:]
             selected = val_indices[len(val_indices) // 2:]
+        participants = {self.ict_pairs[index].get('participant_id', 'unknown') for index in selected}
+        return selected, participants
+
+    def _create_original_per_source_split(self, split, train_ratio):
+        """The original split applied to each dataset_source on its own, so adding or removing
+        a source never changes another source's train/val/test pairs."""
+        if split not in {'train', 'val', 'test'}:
+            raise ValueError(f"Split must be 'train', 'val', or 'test', got {split}")
+        by_source = {}
+        for index, pair in enumerate(self.ict_pairs):
+            by_source.setdefault(pair.get('dataset_source', 'unknown'), []).append(index)
+        selected = []
+        for indices in by_source.values():
+            random.seed(42)
+            shuffled = indices[:]
+            random.shuffle(shuffled)
+            split_idx = int(len(shuffled) * train_ratio)
+            if split == 'train':
+                selected.extend(shuffled[:split_idx])
+            elif split == 'val':
+                selected.extend(shuffled[split_idx:])
+            else:
+                val_indices = shuffled[split_idx:]
+                selected.extend(val_indices[len(val_indices) // 2:])
         participants = {self.ict_pairs[index].get('participant_id', 'unknown') for index in selected}
         return selected, participants
 
@@ -908,10 +936,22 @@ class DynamicMaskingDataloader(Dataset):
             width = min(length, random.randint(crop_units[0], crop_units[1]))
             start = random.randint(0, length - width)
             eeg_compact = eeg_compact[start:start + width]
-        eeg_full = np.zeros((self.global_max_words, self.global_max_time, self.global_max_channels), dtype=np.float32)
-        eeg_full[:eeg_compact.shape[0]] = eeg_compact
-        eeg_tensor = torch.from_numpy(eeg_full)
-        eeg_tensor = self._normalize_eeg(eeg_tensor)
+        fm_adapter = getattr(self, 'fm_adapter', None)
+        if fm_adapter is not None:
+            cache = self.__dict__.setdefault('_fm_unit_cache', {})
+            units = cache.get(idx) if not crop_units else None
+            if units is None:
+                units = fm_adapter(eeg_compact[:self.global_max_words], sample['dataset_source'])
+                if not crop_units:
+                    cache[idx] = units
+            eeg_tensor = torch.zeros((self.global_max_words, fm_adapter.n_times, fm_adapter.n_channels))
+            eeg_tensor[:len(units)] = torch.from_numpy(units)
+        else:
+            eeg_full = np.zeros((self.global_max_words, self.global_max_time, self.global_max_channels),
+                                dtype=np.float32)
+            eeg_full[:eeg_compact.shape[0]] = eeg_compact
+            eeg_tensor = torch.from_numpy(eeg_full)
+            eeg_tensor = self._normalize_eeg(eeg_tensor)
 
         # Multi-vector mask
         mv_mask = torch.ones(self.num_vectors, dtype=torch.float32)
