@@ -123,7 +123,7 @@ def resources(item: dict) -> tuple[str, str]:
     fm = "--eeg_arch" in item["overrides"]["extra_args"]
     memory = "256G" if {"audio", "visual"} <= set(item["sources"]) else "128G"
     external = {"audio", "visual"} & set(item["sources"])
-    time = "3-00:00:00" if fm else "2-00:00:00" if external else "1-00:00:00"
+    time = "2-00:00:00" if fm or external else "1-00:00:00"
     return memory, time
 
 
