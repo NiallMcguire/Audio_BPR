@@ -26,6 +26,7 @@ from pathlib import Path
 import mne
 import numpy as np
 import pandas as pd
+from scipy.optimize import linear_sum_assignment
 
 SENTENCE_FILE = Path.home() / "Sentence Materials" / "REPLICATION_ITEMS.xlsx"
 CHANNELS = ["F7", "F3", "Fz", "F4", "F8", "FC5", "FC1", "FC2", "FC6", "C3", "Cz", "C4",
@@ -136,12 +137,14 @@ def channel_picks(raw: mne.io.BaseRaw) -> dict:
         standard = mne.channels.make_standard_montage("standard_1005").get_positions()["ch_pos"]
         names = [name for name in biosemi if name in raw.ch_names]
         directions = np.array([biosemi[name] / np.linalg.norm(biosemi[name]) for name in names])
-        for target in CHANNELS:
-            if target not in picks:
-                angle = np.degrees(np.arccos(np.clip(directions @ (standard[target] / np.linalg.norm(standard[target])),
-                                                     -1, 1)))
-                if angle.min() <= MAX_BIOSEMI_DEGREES:
-                    picks[target] = names[int(angle.argmin())]
+        targets = [target for target in CHANNELS if target not in picks]
+        available = [i for i, name in enumerate(names) if name not in picks.values()]
+        target_directions = np.array([standard[target] / np.linalg.norm(standard[target]) for target in targets])
+        angles = np.degrees(np.arccos(np.clip(target_directions @ directions[available].T, -1, 1)))
+        rows, columns = linear_sum_assignment(angles)
+        for row, column in zip(rows, columns):
+            if angles[row, column] <= MAX_BIOSEMI_DEGREES:
+                picks[targets[row]] = names[available[column]]
     return picks
 
 
