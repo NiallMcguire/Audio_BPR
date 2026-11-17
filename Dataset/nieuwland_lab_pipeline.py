@@ -8,9 +8,12 @@
 from __future__ import annotations
 
 import json
+import http.client
 import re
 import shutil
 import sys
+import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -63,6 +66,37 @@ def wanted(lab: str, name: str) -> bool:
     return True
 
 
+def _download(url: str, target: Path, size: int) -> None:
+    for attempt in range(8):
+        offset = target.stat().st_size if target.exists() else 0
+        if offset == size:
+            return
+        if offset > size:
+            target.unlink()
+            offset = 0
+        request = urllib.request.Request(url, headers={"Range": f"bytes={offset}-"} if offset else {})
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                content_range = response.headers.get("Content-Range", "")
+                resume = offset > 0 and response.status == 206
+                if resume and not content_range.startswith(f"bytes {offset}-"):
+                    raise OSError(f"Unexpected Content-Range: {content_range}")
+                with target.open("ab" if resume else "wb") as stream:
+                    while chunk := response.read(8 * 1024 * 1024):
+                        stream.write(chunk)
+            actual = target.stat().st_size
+            if actual == size:
+                return
+            if actual > size:
+                target.unlink()
+                raise OSError(f"Downloaded {actual} bytes, expected {size}")
+            raise EOFError(f"Downloaded {actual} of {size} bytes")
+        except (OSError, EOFError, TimeoutError, urllib.error.URLError, http.client.HTTPException):
+            if attempt == 7:
+                raise
+            time.sleep(min(attempt + 1, 10))
+
+
 def download_lab(lab: str, index: dict) -> Path:
     folder = ROOT / lab
     folder.mkdir(parents=True, exist_ok=True)
@@ -72,7 +106,7 @@ def download_lab(lab: str, index: dict) -> Path:
         target = folder / Path(name).name
         if target.exists() and target.stat().st_size == size:
             continue
-        urllib.request.urlretrieve(url, target)
+        _download(url, target, size)
         if target.suffix == ".zip":
             with zipfile.ZipFile(target) as archive:
                 for member in archive.namelist():
