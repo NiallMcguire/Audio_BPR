@@ -25,7 +25,7 @@ def best_validation_loss(log: Path) -> float | None:
 def select_best() -> dict:
     selected = {}
     diagnostics = {}
-    log_dir = STAGE1A / "logs"
+    log_dirs = (STAGE1A / "logs", STAGE1A / STAGE1A.name / "logs")
     for modality in MODALITIES:
         candidates = []
         for model in MODELS:
@@ -33,7 +33,7 @@ def select_best() -> dict:
                 losses = []
                 for seed in SEEDS:
                     pattern = f"s1a_{model}_{finetune}_{modality}_seed{seed}-*.out"
-                    logs = list(log_dir.glob(pattern))
+                    logs = [path for log_dir in log_dirs for path in log_dir.glob(pattern)]
                     if len(logs) == 1:
                         loss = best_validation_loss(logs[0])
                         if loss is not None:
