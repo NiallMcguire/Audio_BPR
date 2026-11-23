@@ -13,7 +13,37 @@ import hashlib
 from typing import Dict, List, Optional, Tuple
 import warnings
 
-SPLIT_STRATEGIES = {'pair', 'target', 'trial', 'original', 'original_fixed'}
+SPLIT_STRATEGIES = {
+    'pair', 'target', 'trial', 'original', 'original_fixed', 'subject_10fold', 'query_10fold'
+}
+ROTATION_FOLDS = 10
+
+
+def _rotation_assignments(group_ids, fold: int, seed: int) -> dict[str, str]:
+    if not 1 <= fold <= ROTATION_FOLDS:
+        raise ValueError(f"fold must be between 1 and {ROTATION_FOLDS}, got {fold}")
+    groups = sorted({str(group_id) for group_id in group_ids})
+    if len(groups) < ROTATION_FOLDS:
+        raise ValueError(f"10-fold rotation needs at least 10 groups, got {len(groups)}")
+    random.Random(seed).shuffle(groups)
+    folds = [groups[index::ROTATION_FOLDS] for index in range(ROTATION_FOLDS)]
+    test_fold = fold - 1
+    val_fold = fold % ROTATION_FOLDS
+    assignments = {}
+    for index, fold_groups in enumerate(folds):
+        split = 'test' if index == test_fold else 'val' if index == val_fold else 'train'
+        assignments.update((group_id, split) for group_id in fold_groups)
+    return assignments
+
+
+def _question_group_id(pair: dict) -> str:
+    document_id = pair.get('question_document_id')
+    if document_id:
+        return str(document_id)
+    question = ' '.join(str(pair.get('question_text', '')).casefold().split())
+    if question:
+        return question
+    raise ValueError("query_10fold requires question_document_id or question_text")
 
 
 def create_positive_negative_pairs(batch):
@@ -350,6 +380,10 @@ class DynamicMaskingDataloader(Dataset):
             if self.debug:
                 print("Using trial-grouped Task split; other sources use pair-level split")
             self.indices, self.unique_subjects = self._create_trial_split(split, train_ratio, pair_split_seed)
+        elif split_strategy == 'subject_10fold':
+            self.indices, self.unique_subjects = self._create_rotation_split(split, fold, pair_split_seed, 'subject')
+        elif split_strategy == 'query_10fold':
+            self.indices, self.unique_subjects = self._create_rotation_split(split, fold, pair_split_seed, 'query')
         elif split_strategy == 'original':
             if self.debug:
                 print("Using original Audio BPR random sample split")
@@ -517,6 +551,27 @@ class DynamicMaskingDataloader(Dataset):
                     selected.extend(indices)
 
         participants = {self.ict_pairs[index].get('participant_id', 'unknown') for index in selected}
+        return selected, participants
+
+    def _create_rotation_split(self, split, fold, seed, group_type):
+        if split not in {'train', 'val', 'test'}:
+            raise ValueError(f"Split must be 'train', 'val', or 'test', got {split}")
+        if fold is None:
+            raise ValueError(f"{self.split_strategy} requires --cv-fold between 1 and {ROTATION_FOLDS}")
+        group_ids = []
+        for pair in self.ict_pairs:
+            if group_type == 'subject':
+                group_id = pair.get('participant_id')
+                if group_id is None:
+                    raise ValueError("subject_10fold requires participant_id on every pair")
+                group_ids.append(str(group_id))
+            else:
+                group_ids.append(_question_group_id(pair))
+        assignments = _rotation_assignments(group_ids, fold, seed)
+        selected = [index for index, group_id in enumerate(group_ids) if assignments[group_id] == split]
+        participants = {self.ict_pairs[index].get('participant_id', 'unknown') for index in selected}
+        if not selected:
+            raise ValueError(f"Empty {split} split for {self.split_strategy}, fold {fold}")
         return selected, participants
 
         if self.debug:

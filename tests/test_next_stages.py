@@ -51,6 +51,46 @@ class NextStageTests(unittest.TestCase):
                       if row[0] == "authentic_query_response"]
             self.assertNotEqual(sorted(pooled), sorted(split_pairs(task, "original", "test")))
 
+    def test_subject_10fold_keeps_people_disjoint_and_tests_each_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = write_synthetic_pairs(Path(temp_dir) / "task.npy", "authentic_query_response", 400, False)
+            pairs = np.load(path, allow_pickle=True).item()["ict_pairs"]
+            all_participants = {pair["participant_id"] for pair in pairs}
+            tested = set()
+            for fold in range(1, 11):
+                groups = {}
+                for split in ("train", "val", "test"):
+                    dataset = DynamicMaskingDataloader(
+                        combined_dataset={"ict_pairs": pairs, "metadata": {}}, tokenizer=TinyTokenizer(),
+                        max_text_len=32, split=split, global_eeg_dims=(2, 8, 2),
+                        split_strategy="subject_10fold", fold=fold, pair_split_seed=42)
+                    groups[split] = {pairs[index]["participant_id"] for index in dataset.indices}
+                self.assertFalse(groups["train"] & groups["val"])
+                self.assertFalse(groups["train"] & groups["test"])
+                self.assertFalse(groups["val"] & groups["test"])
+                tested.update(groups["test"])
+            self.assertEqual(tested, all_participants)
+
+    def test_query_10fold_groups_same_question_across_people(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = write_synthetic_pairs(Path(temp_dir) / "task.npy", "authentic_query_response", 400, False)
+            pairs = np.load(path, allow_pickle=True).item()["ict_pairs"]
+            all_questions = {pair["question_document_id"] for pair in pairs}
+            tested = set()
+            for fold in range(1, 11):
+                groups = {}
+                for split in ("train", "val", "test"):
+                    dataset = DynamicMaskingDataloader(
+                        combined_dataset={"ict_pairs": pairs, "metadata": {}}, tokenizer=TinyTokenizer(),
+                        max_text_len=32, split=split, global_eeg_dims=(2, 8, 2),
+                        split_strategy="query_10fold", fold=fold, pair_split_seed=42)
+                    groups[split] = {pairs[index]["question_document_id"] for index in dataset.indices}
+                self.assertFalse(groups["train"] & groups["val"])
+                self.assertFalse(groups["train"] & groups["test"])
+                self.assertFalse(groups["val"] & groups["test"])
+                tested.update(groups["test"])
+            self.assertEqual(tested, all_questions)
+
     def test_best_checkpoint_copy_restores_the_best_epoch(self):
         def fake_epoch(model, **_):
             with torch.no_grad():
@@ -175,7 +215,7 @@ class NextStageTests(unittest.TestCase):
             script = (output / "jobs" / "s1a_reve_top_reading_seed42.sbatch").read_text()
             for expected in ("--eeg_arch reve", "--fm-finetune top", "--split-strategy original_fixed",
                              "--best-checkpoint-copy", "--primary-eval-source authentic_query",
-                             "export HF_HUB_OFFLINE=1", "--time=3-00:00:00"):
+                             "export HF_HUB_OFFLINE=1", "--time=2-00:00:00"):
                 self.assertIn(expected, script)
 
 

@@ -68,7 +68,7 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
                        global_eeg_dims=None, combined_dataset=None,
                        pair_split_seed=42, balance_sources=False,
                        split_strategy='pair', train_sources=None, eeg_unit_shape=None,
-                       question_positive=False, fm_adapter=None):
+                       question_positive=False, fm_adapter=None, cv_fold=None):
     """Create training, validation, and test dataloaders"""
 
     # Load each source once. Reopening a very large .npy three times for train,
@@ -105,7 +105,7 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
         train_ratio=train_ratio, global_eeg_dims=global_eeg_dims,
         dataset_type='original', holdout_subjects=holdout_subjects,
         initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed,
-        split_strategy=split_strategy
+        split_strategy=split_strategy, fold=cv_fold
     )
     # Validation and test keep every loaded source so all ablation arms share them.
     if train_sources:
@@ -121,7 +121,7 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
         train_ratio=train_ratio, global_eeg_dims=global_eeg_dims,
         dataset_type='original', holdout_subjects=holdout_subjects,
         initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed,
-        split_strategy=split_strategy
+        split_strategy=split_strategy, fold=cv_fold
     )
 
     test_dataset = DynamicMaskingDataloader(
@@ -130,7 +130,7 @@ def create_dataloaders(data_path, tokenizer, batch_size, max_text_len, max_eeg_l
         train_ratio=train_ratio, global_eeg_dims=global_eeg_dims,
         dataset_type='original', holdout_subjects=holdout_subjects,
         initial_masking_probability=training_masking_prob, pair_split_seed=pair_split_seed,
-        split_strategy=split_strategy
+        split_strategy=split_strategy, fold=cv_fold
     )
     if fm_adapter is not None:
         for dataset in (train_dataset, val_dataset, test_dataset):
@@ -283,10 +283,13 @@ def main():
                         help='Use subject-based train/val/test split')
     parser.add_argument('--balance_sources', action='store_true',
                         help='Sample mixed-source training pairs with equal source probability')
-    parser.add_argument('--split-strategy', choices=('pair', 'target', 'trial', 'original', 'original_fixed'),
+    parser.add_argument('--split-strategy', choices=('pair', 'target', 'trial', 'original', 'original_fixed',
+                                                     'subject_10fold', 'query_10fold'),
                         default='pair',
                         help='Pair-level, target-grouped, Task trial-grouped, original Audio BPR random split, '
-                             'or the original split applied per source (fixed task test set across arms)')
+                             'original split per source, or rotating 10-fold subject/query split')
+    parser.add_argument('--cv-fold', type=int, choices=range(1, 11), default=None,
+                        help='One-based fold number for subject_10fold or query_10fold')
     parser.add_argument('--train-sources', nargs='+', default=None,
                         help='dataset_source values used for training; val/test keep all loaded sources')
     parser.add_argument('--multi-positive-loss', action='store_true',
@@ -452,6 +455,7 @@ def main():
         eeg_unit_shape=args.eeg_unit_shape,
         question_positive=args.question_as_positive,
         fm_adapter=fm_adapter,
+        cv_fold=args.cv_fold,
     )
 
     training_val_dataloader = val_dataloader
@@ -486,6 +490,7 @@ def main():
         'pair_level_split': not args.holdout_subjects,
         'pair_split_seed': args.seed,
         'split_strategy': args.split_strategy,
+        'cv_fold': args.cv_fold,
         'balance_sources': args.balance_sources,
         'multi_positive_loss': args.multi_positive_loss,
         'grad_clip': args.grad_clip,
