@@ -3,6 +3,7 @@
 Simplified Training for Brain Passage Retrieval with DYNAMIC MULTI-MASKING VALIDATION
 Uses single dataloader that changes masking probability on-the-fly
 """
+import hashlib
 import random
 
 import torch
@@ -1599,6 +1600,11 @@ def validate_epoch(model, val_dataloader, device, epoch_num,
     return primary_metrics['loss'], primary_main_metric
 
 
+def _limit_wandb_tags(tags):
+    return [tag if len(tag) <= 64 else f"{tag[:55]}-{hashlib.sha1(tag.encode()).hexdigest()[:8]}"
+            for tag in tags]
+
+
 def initialize_wandb(config):
     """Initialize wandb logging"""
 
@@ -1666,6 +1672,7 @@ def initialize_wandb(config):
         tags.extend(['text-baseline', 'text-query'])
     else:
         tags.extend(['eeg', 'eeg-query'])
+    tags = _limit_wandb_tags(tags)
 
     wandb.init(
         project=config.get('wandb_project', 'ECIR2026'),

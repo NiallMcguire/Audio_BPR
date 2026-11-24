@@ -15,7 +15,7 @@ sys.path.insert(0, str(AUDIO_BPR_DIR))
 from fm_encoders import FMInputAdapter, channel_layout, load_montages
 from mv_dataloader import DynamicMaskingDataloader
 from mv_models import create_model
-from mv_training import train_model
+from mv_training import _limit_wandb_tags, train_model
 from tests.test_experiment_pipeline import TinyTokenizer, write_synthetic_pairs
 
 try:
@@ -33,6 +33,14 @@ def split_pairs(pairs, strategy, split):
 
 
 class NextStageTests(unittest.TestCase):
+    def test_wandb_tags_are_bounded_and_long_tags_remain_distinct(self):
+        tags = ["short", "condition-gen_query_10fold_transformer_typing_continuous_fold01_seed42",
+                "condition-gen_subject_10fold_transformer_typing_continuous_fold01_seed42"]
+        bounded = _limit_wandb_tags(tags)
+        self.assertEqual(bounded[0], "short")
+        self.assertTrue(all(1 <= len(tag) <= 64 for tag in bounded))
+        self.assertNotEqual(bounded[1], bounded[2])
+
     def test_original_fixed_split_keeps_task_test_set_when_sources_are_added(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
