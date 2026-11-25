@@ -26,12 +26,16 @@ SPLITS = {
 }
 
 
-def build_plan(output_dir: Path) -> list[dict]:
+def build_plan(output_dir: Path, selected_modalities=None) -> list[dict]:
     paths = source_paths(AUDIO_DATA, VISUAL_DATA, TASK_DATA)
+    selected_modalities = set(selected_modalities or BEST_MODELS)
+    unknown = selected_modalities - set(BEST_MODELS)
+    if unknown:
+        raise ValueError(f"Unsupported modalities: {sorted(unknown)}")
     plan = []
     for split_strategy in SPLITS:
         for modality, (source_names, settings) in MODALITIES.items():
-            if modality not in BEST_MODELS:
+            if modality not in selected_modalities:
                 continue
             fm_model, fm_tuning = BEST_MODELS[modality]
             mixed_sources = (*source_names, "audio", "visual")
@@ -75,14 +79,15 @@ def build_plan(output_dir: Path) -> list[dict]:
     return plan
 
 
-def prepare(output_dir: Path) -> Path:
+def prepare(output_dir: Path, selected_modalities=None) -> Path:
     output_dir = output_dir.resolve()
     matrix_path = output_dir / "experiment_matrix.json"
     if matrix_path.exists():
         raise FileExistsError(f"{matrix_path} exists")
     jobs_dir = output_dir / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
-    plan = build_plan(output_dir)
+    selected_modalities = tuple(selected_modalities or BEST_MODELS)
+    plan = build_plan(output_dir, selected_modalities)
     by_name = {item["name"]: item for item in plan}
     for item in plan:
         command = _controller_command(
@@ -102,7 +107,8 @@ def prepare(output_dir: Path) -> Path:
         )
         script.chmod(0o755)
         item["job_script"] = str(script)
-    assert len(by_name) == len(plan) == 360
+    expected_count = len(SPLITS) * len(selected_modalities) * 2 * len(FOLDS) * len(SEEDS)
+    assert len(by_name) == len(plan) == expected_count
     matrix_path.write_text(json.dumps({
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "submitted": False,
@@ -112,6 +118,7 @@ def prepare(output_dir: Path) -> Path:
         "split_policies": SPLITS,
         "baseline": "Audio BPR Transformer (eeg_arch=transformer), trained from scratch",
         "foundation_models": "EEGPT-full for reading and imagining; REVE-full for continuous typing",
+        "selected_modalities": selected_modalities,
         "external_training_data": True,
         "data_sources": ["task", "Alice", "Nieuwland all-labs (332 participants)"],
         "source_balancing": "Equal-probability source sampling for training; all sources appear in each split.",
@@ -130,11 +137,13 @@ def prepare(output_dir: Path) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--modalities", nargs="+", choices=tuple(BEST_MODELS), default=None,
+                        help="Modalities to run; defaults to reading, continuous typing and imagining")
     parser.add_argument("--date", default=datetime.now().strftime("%Y%m%d"))
     args = parser.parse_args()
     output = args.output_dir or AUDIO_BPR_DIR / f"prepared_experiments_{args.date}_generalization"
-    print(f"Prepared {len(build_plan(output))} runs in {output}; nothing was submitted.")
-    prepare(output)
+    print(f"Prepared {len(build_plan(output, args.modalities))} runs in {output}; nothing was submitted.")
+    prepare(output, args.modalities)
 
 
 if __name__ == "__main__":
