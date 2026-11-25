@@ -165,7 +165,7 @@ class SimplifiedBrainRetrieval(nn.Module):
             # Initialize on the model's current device; create_model moves the
             # complete model to the requested device immediately afterward.
             device = next(self.parameters()).device
-            self.eeg_encoder = self._create_eeg_encoder(input_size, device)
+            self.eeg_encoder = self._create_eeg_encoder(input_size, device, max_seq_len=num_words)
             print(f"✓ Initialized EEG encoder during model creation with input size {input_size} on device {device}")
         else:
             self.eeg_encoder = None
@@ -217,7 +217,7 @@ class SimplifiedBrainRetrieval(nn.Module):
                 padding_idx=0
             ).to(next(self.parameters()).device)
 
-    def _create_eeg_encoder(self, input_size, device):
+    def _create_eeg_encoder(self, input_size, device, max_seq_len=50):
         """Create EEG encoder based on architecture choice"""
 
         if self.eeg_arch == 'simple':
@@ -249,7 +249,7 @@ class SimplifiedBrainRetrieval(nn.Module):
                 num_heads=4,  # SIMPLIFIED: Reduced from 8 to 4
                 num_layers=1,  # SIMPLIFIED: Keep at 1 layer
                 dropout=0.3,  # INCREASED REGULARIZATION: from 0.1 to 0.3
-                max_seq_len=50  # Set based on your max_eeg_len
+                max_seq_len=max_seq_len
             )
         else:
             raise ValueError(f"Unknown EEG architecture: {self.eeg_arch}")
@@ -344,7 +344,7 @@ class SimplifiedBrainRetrieval(nn.Module):
         # Create EEG encoder if needed (fallback for backward compatibility)
         if self.eeg_encoder is None:
             print("⚠ Warning: Creating EEG encoder during forward pass (should have been created during init)")
-            self.eeg_encoder = self._create_eeg_encoder(input_size, eeg_input.device)
+            self.eeg_encoder = self._create_eeg_encoder(input_size, eeg_input.device, max_seq_len=num_words)
 
         # FIXED: Compute padding mask BEFORE any processing
         # Based on original EEG input, not projected values
@@ -662,7 +662,7 @@ class CrossEncoderBrainRetrieval(nn.Module):
             device = next(self.text_projection.parameters()).device if hasattr(self.text_projection,
                                                                                'weight') else torch.device(
                 'cuda' if torch.cuda.is_available() else 'cpu')
-            self.eeg_encoder = self._create_eeg_encoder(input_size, device)
+            self.eeg_encoder = self._create_eeg_encoder(input_size, device, max_seq_len=num_words)
             print(f"✓ Initialized EEG encoder during model creation with input size {input_size} on device {device}")
         else:
             self.eeg_encoder = None
@@ -706,7 +706,7 @@ class CrossEncoderBrainRetrieval(nn.Module):
                 padding_idx=0
             ).to(next(self.parameters()).device)
 
-    def _create_eeg_encoder(self, input_size, device):
+    def _create_eeg_encoder(self, input_size, device, max_seq_len=50):
         """Create EEG encoder (same as dual encoder)"""
         if self.eeg_arch == 'simple':
             encoder = nn.Sequential(
@@ -737,7 +737,7 @@ class CrossEncoderBrainRetrieval(nn.Module):
                 num_heads=4,
                 num_layers=1,
                 dropout=0.3,
-                max_seq_len=50
+                max_seq_len=max_seq_len
             )
         else:
             raise ValueError(f"Unknown EEG architecture: {self.eeg_arch}")
@@ -783,7 +783,8 @@ class CrossEncoderBrainRetrieval(nn.Module):
             # Create EEG encoder if needed (fallback for backward compatibility)
             if self.eeg_encoder is None:
                 print("⚠ Warning: Creating EEG encoder during forward pass (should have been created during init)")
-                self.eeg_encoder = self._create_eeg_encoder(input_size, eeg_queries.device)
+                self.eeg_encoder = self._create_eeg_encoder(input_size, eeg_queries.device,
+                                                            max_seq_len=num_words)
 
             # FIXED: Compute padding mask before processing
             eeg_padding_mask = (eeg_queries.abs().sum(dim=(2, 3)) == 0)

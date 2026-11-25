@@ -41,6 +41,16 @@ class NextStageTests(unittest.TestCase):
         self.assertTrue(all(1 <= len(tag) <= 64 for tag in bounded))
         self.assertNotEqual(bounded[1], bounded[2])
 
+    def test_transformer_sequence_limit_uses_configured_eeg_length(self):
+        model = create_model(hidden_dim=8, eeg_arch="transformer", device="cpu", use_lora=False,
+                             pooling_strategy="mean", encoder_type="dual", global_eeg_dims=(100, 8, 2),
+                             query_type="eeg", use_pretrained_text=False)
+        eeg = torch.randn(2, 100, 8, 2)
+        with torch.no_grad():
+            encoded = model.encode_eeg(eeg, torch.ones(2, 32))
+        self.assertEqual(model.eeg_encoder.max_seq_len, 100)
+        self.assertEqual(tuple(encoded.shape), (2, 1, 8))
+
     def test_original_fixed_split_keeps_task_test_set_when_sources_are_added(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
