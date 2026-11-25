@@ -19,31 +19,47 @@ SPLIT_STRATEGIES = {
 ROTATION_FOLDS = 10
 
 
-def _rotation_assignments(group_ids, fold: int, seed: int) -> dict[str, str]:
+def _rotation_assignments(group_ids, fold: int, seed: int, group_strata=None) -> dict[str, str]:
     if not 1 <= fold <= ROTATION_FOLDS:
         raise ValueError(f"fold must be between 1 and {ROTATION_FOLDS}, got {fold}")
-    groups = sorted({str(group_id) for group_id in group_ids})
-    if len(groups) < ROTATION_FOLDS:
-        raise ValueError(f"10-fold rotation needs at least 10 groups, got {len(groups)}")
-    random.Random(seed).shuffle(groups)
-    folds = [groups[index::ROTATION_FOLDS] for index in range(ROTATION_FOLDS)]
     test_fold = fold - 1
     val_fold = fold % ROTATION_FOLDS
     assignments = {}
-    for index, fold_groups in enumerate(folds):
-        split = 'test' if index == test_fold else 'val' if index == val_fold else 'train'
-        assignments.update((group_id, split) for group_id in fold_groups)
+    groups_by_stratum = {}
+    for group_id in sorted({str(group_id) for group_id in group_ids}):
+        stratum = str(group_strata[group_id]) if group_strata else 'all'
+        groups_by_stratum.setdefault(stratum, []).append(group_id)
+    sparse_groups = []
+    for stratum, groups in groups_by_stratum.items():
+        if len(groups) < ROTATION_FOLDS:
+            sparse_groups.extend(groups)
+            continue
+        random.Random(f"{seed}:{stratum}").shuffle(groups)
+        folds = [groups[index::ROTATION_FOLDS] for index in range(ROTATION_FOLDS)]
+        for index, fold_groups in enumerate(folds):
+            split = 'test' if index == test_fold else 'val' if index == val_fold else 'train'
+            assignments.update((group_id, split) for group_id in fold_groups)
+    if sparse_groups:
+        random.Random(f"{seed}:sparse").shuffle(sparse_groups)
+        folds = [sparse_groups[index::ROTATION_FOLDS] for index in range(ROTATION_FOLDS)]
+        for index, fold_groups in enumerate(folds):
+            split = 'test' if index == test_fold else 'val' if index == val_fold else 'train'
+            assignments.update((group_id, split) for group_id in fold_groups)
     return assignments
 
 
 def _question_group_id(pair: dict) -> str:
-    document_id = pair.get('question_document_id')
+    question_document_id = pair.get('question_document_id')
+    if question_document_id:
+        return f"question:{question_document_id}"
+    text = pair.get('question_text') or pair.get('doc_text') or pair.get('full_sentence_text')
+    normalized = ' '.join(str(text or '').casefold().split())
+    if normalized:
+        return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+    document_id = pair.get('document_id') or pair.get('query_group_id')
     if document_id:
         return str(document_id)
-    question = ' '.join(str(pair.get('question_text', '')).casefold().split())
-    if question:
-        return question
-    raise ValueError("query_10fold requires question_document_id or question_text")
+    raise ValueError("query_10fold requires question text or a stable document ID")
 
 
 def create_positive_negative_pairs(batch):
@@ -559,15 +575,24 @@ class DynamicMaskingDataloader(Dataset):
         if fold is None:
             raise ValueError(f"{self.split_strategy} requires --cv-fold between 1 and {ROTATION_FOLDS}")
         group_ids = []
+        group_strata = {}
+        query_sources = {}
         for pair in self.ict_pairs:
+            source = str(pair.get('training_source', pair.get('dataset_source', 'unknown')))
             if group_type == 'subject':
                 group_id = pair.get('participant_id')
                 if group_id is None:
                     raise ValueError("subject_10fold requires participant_id on every pair")
-                group_ids.append(str(group_id))
+                group_id = f"{source}\0{group_id}"
+                group_strata[group_id] = source
             else:
-                group_ids.append(_question_group_id(pair))
-        assignments = _rotation_assignments(group_ids, fold, seed)
+                group_id = _question_group_id(pair)
+                query_sources.setdefault(group_id, set()).add(source)
+            group_ids.append(group_id)
+        if group_type == 'query':
+            group_strata = {group_id: "\0".join(sorted(sources))
+                            for group_id, sources in query_sources.items()}
+        assignments = _rotation_assignments(group_ids, fold, seed, group_strata)
         selected = [index for index, group_id in enumerate(group_ids) if assignments[group_id] == split]
         participants = {self.ict_pairs[index].get('participant_id', 'unknown') for index in selected}
         if not selected:

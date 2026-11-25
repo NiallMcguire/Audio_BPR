@@ -1981,33 +1981,48 @@ def test_model(model, test_dataloader, device, debug=False,
             level_results = {**main_masking_results, **dataset_ranking_results}
             all_test_metrics.update(level_results)
 
+            noise_prefix = f'test_ranking/noise/masking_{masking_level}'
+            noise_results = perform_noise_ranking_evaluation(
+                model, test_dataloader, device, masking_level, metric_prefix=noise_prefix
+            )
+            all_test_metrics.update(noise_results)
+            if is_primary:
+                all_test_metrics.update({
+                    key.replace(noise_prefix, 'test_ranking/noise', 1): value
+                    for key, value in noise_results.items()
+                })
+
+            if expanded_eval_index is not None:
+                expanded_results = evaluate_expanded_candidate_index(
+                    model, test_dataloader, device, expanded_eval_index,
+                    prefix=f'test_ranking/expanded_index/masking_{masking_level}',
+                    masking_level=masking_level,
+                )
+                expanded_noise_results = evaluate_expanded_candidate_index(
+                    model, test_dataloader, device, expanded_eval_index,
+                    prefix=f'test_ranking/expanded_index_noise/masking_{masking_level}',
+                    masking_level=masking_level, use_noise=True,
+                )
+                all_test_metrics.update(expanded_results)
+                all_test_metrics.update(expanded_noise_results)
+                if is_primary:
+                    all_test_metrics.update({
+                        key.replace(f'test_ranking/expanded_index/masking_{masking_level}',
+                                    'test_ranking/expanded_index', 1): value
+                        for key, value in expanded_results.items()
+                    })
+                    all_test_metrics.update({
+                        key.replace(f'test_ranking/expanded_index_noise/masking_{masking_level}',
+                                    'test_ranking/expanded_index_noise', 1): value
+                        for key, value in expanded_noise_results.items()
+                    })
+
             # Print summary for this masking level
             if main_ranking_results:
                 main_mrr = main_ranking_results.get('test_ranking/main/rr', 0)
                 main_hit1 = main_ranking_results.get('test_ranking/main/hit_at_1', 0)
                 main_hit10 = main_ranking_results.get('test_ranking/main/hit_at_10', 0)
                 print(f"  {masking_level}% Masking: MRR {main_mrr:.4f}, Hit@1 {main_hit1:.4f}, Hit@10 {main_hit10:.4f}")
-
-        # 4. Noise baseline evaluation (at primary masking level)
-        print(f"\n=== NOISE BASELINE AT {primary_masking_level}% MASKING ===")
-        test_dataloader.dataset.set_masking_probability(primary_masking_level / 100.0)
-        noise_ranking_results = perform_noise_ranking_evaluation(
-            model, test_dataloader, device, primary_masking_level
-        )
-        all_test_metrics.update(noise_ranking_results)
-
-        if expanded_eval_index is not None:
-            expanded_results = evaluate_expanded_candidate_index(
-                model, test_dataloader, device, expanded_eval_index,
-                prefix="test_ranking/expanded_index", masking_level=primary_masking_level,
-            )
-            expanded_noise_results = evaluate_expanded_candidate_index(
-                model, test_dataloader, device, expanded_eval_index,
-                prefix="test_ranking/expanded_index_noise", masking_level=primary_masking_level,
-                use_noise=True,
-            )
-            all_test_metrics.update(expanded_results)
-            all_test_metrics.update(expanded_noise_results)
 
         # 5. Calculate cross-masking performance comparisons
         masking_comparison_metrics = calculate_masking_performance_trends(
@@ -2367,7 +2382,8 @@ def perform_dataset_specific_ranking(model, dataloader, device, epoch_num, subse
     return all_dataset_metrics
 
 
-def perform_noise_ranking_evaluation(model, test_dataloader, device, primary_masking_level=90):
+def perform_noise_ranking_evaluation(model, test_dataloader, device, primary_masking_level=90,
+                                     metric_prefix='test_ranking/noise'):
     """
     Perform ranking evaluation with noise queries as baseline
 
@@ -2439,25 +2455,25 @@ def perform_noise_ranking_evaluation(model, test_dataloader, device, primary_mas
 
         for metric_name in metric_names:
             values = [m[metric_name] for m in all_metrics]
-            noise_metrics[f'test_ranking/noise/{metric_name}'] = np.mean(values)
+            noise_metrics[f'{metric_prefix}/{metric_name}'] = np.mean(values)
             if metric_name != 'rank_of_correct':
-                noise_metrics[f'test_ranking/noise/{metric_name}_std'] = np.std(values)
+                noise_metrics[f'{metric_prefix}/{metric_name}_std'] = np.std(values)
 
         noise_metrics.update({
-            'test_ranking/noise/num_unique_documents': len(doc_list),
-            'test_ranking/noise/num_queries_evaluated': len(all_metrics),
-            'test_ranking/noise/subset_size': subset_size,
-            'test_ranking/noise/masking_level': primary_masking_level
+            f'{metric_prefix}/num_unique_documents': len(doc_list),
+            f'{metric_prefix}/num_queries_evaluated': len(all_metrics),
+            f'{metric_prefix}/subset_size': subset_size,
+            f'{metric_prefix}/masking_level': primary_masking_level
         })
 
         # Print noise baseline results
         print(f"Noise Baseline Ranking Results:")
         print(f"  Queries Evaluated: {len(all_metrics)}")
-        print(f"  MRR: {noise_metrics['test_ranking/noise/rr']:.4f}")
-        print(f"  Hit@1: {noise_metrics['test_ranking/noise/hit_at_1']:.4f}")
-        print(f"  Hit@5: {noise_metrics['test_ranking/noise/hit_at_5']:.4f}")
-        print(f"  Hit@10: {noise_metrics['test_ranking/noise/hit_at_10']:.4f}")
-        print(f"  Hit@20: {noise_metrics['test_ranking/noise/hit_at_20']:.4f}")
+        print(f"  MRR: {noise_metrics[f'{metric_prefix}/rr']:.4f}")
+        print(f"  Hit@1: {noise_metrics[f'{metric_prefix}/hit_at_1']:.4f}")
+        print(f"  Hit@5: {noise_metrics[f'{metric_prefix}/hit_at_5']:.4f}")
+        print(f"  Hit@10: {noise_metrics[f'{metric_prefix}/hit_at_10']:.4f}")
+        print(f"  Hit@20: {noise_metrics[f'{metric_prefix}/hit_at_20']:.4f}")
 
         return noise_metrics
 

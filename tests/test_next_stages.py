@@ -13,9 +13,9 @@ AUDIO_BPR_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(AUDIO_BPR_DIR))
 
 from fm_encoders import FMInputAdapter, channel_layout, load_montages
-from mv_dataloader import DynamicMaskingDataloader
+from mv_dataloader import DynamicMaskingDataloader, _question_group_id
 from mv_models import create_model
-from mv_training import _limit_wandb_tags, train_model
+from mv_training import _limit_wandb_tags, test_model, train_model
 from tests.test_experiment_pipeline import TinyTokenizer, write_synthetic_pairs
 
 try:
@@ -50,6 +50,43 @@ class NextStageTests(unittest.TestCase):
             encoded = model.encode_eeg(eeg, torch.ones(2, 32))
         self.assertEqual(model.eeg_encoder.max_seq_len, 100)
         self.assertEqual(tuple(encoded.shape), (2, 1, 8))
+
+    def test_test_model_computes_noise_at_every_masking_level(self):
+        class DatasetStub:
+            unique_subjects = {"participant"}
+
+            def __init__(self):
+                self.probability = 0.9
+
+            def get_current_masking_probability(self):
+                return self.probability
+
+            def set_masking_probability(self, probability):
+                self.probability = probability
+
+            def __len__(self):
+                return 1
+
+        dataloader = SimpleNamespace(dataset=DatasetStub())
+        levels = [0, 25, 50, 75, 90, 100]
+        noise_calls = []
+
+        def fake_noise(_model, _loader, _device, masking_level, metric_prefix):
+            noise_calls.append(masking_level)
+            return {f"{metric_prefix}/rr": masking_level / 100}
+
+        with patch("mv_training.perform_dual_encoder_test_ranking_at_masking_level",
+                   return_value={"test_ranking/main/rr": 0.2}), \
+             patch("mv_training.detect_dataset_sources", return_value={"has_multiple": False}), \
+             patch("mv_training.perform_noise_ranking_evaluation", side_effect=fake_noise), \
+             patch("mv_training.calculate_masking_performance_trends", return_value={}), \
+             patch("mv_training.print_multi_masking_test_summary"), \
+             patch("mv_training.wandb.log"):
+            metrics = test_model(torch.nn.Identity(), dataloader, "cpu", test_masking_levels=levels)
+
+        self.assertEqual(noise_calls, levels)
+        self.assertEqual(metrics["test_ranking/noise/rr"], 0.9)
+        self.assertEqual(dataloader.dataset.probability, 0.9)
 
     def test_original_fixed_split_keeps_task_test_set_when_sources_are_added(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -108,6 +145,51 @@ class NextStageTests(unittest.TestCase):
                 self.assertFalse(groups["val"] & groups["test"])
                 tested.update(groups["test"])
             self.assertEqual(tested, all_questions)
+
+    def test_mixed_source_rotations_include_each_source_and_keep_shared_queries_together(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_path = write_synthetic_pairs(root / "task.npy", "authentic_query_response", 400, False)
+            alice_path = write_synthetic_pairs(root / "alice.npy", "alice", 120, True)
+            nieuwland_path = write_synthetic_pairs(root / "nieuwland.npy", "nieuwland", 120, True)
+            task = np.load(task_path, allow_pickle=True).item()["ict_pairs"]
+            alice = np.load(alice_path, allow_pickle=True).item()["ict_pairs"]
+            nieuwland = np.load(nieuwland_path, allow_pickle=True).item()["ict_pairs"]
+            shared_text = task[0]["query_text"]
+            alice[0]["doc_text"] = shared_text
+            alice[0]["full_sentence_text"] = shared_text
+            alice[0]["doc_words"] = shared_text.split()
+            alice[0]["question_document_id"] = task[0]["question_document_id"]
+            pairs = task + alice + nieuwland
+
+            for strategy in ("subject_10fold", "query_10fold"):
+                split_sources, split_groups = {}, {}
+                shared_group_splits = {}
+                for split in ("train", "val", "test"):
+                    dataset = DynamicMaskingDataloader(
+                        combined_dataset={"ict_pairs": pairs, "metadata": {}}, tokenizer=TinyTokenizer(),
+                        max_text_len=32, split=split, global_eeg_dims=(2, 8, 2),
+                        split_strategy=strategy, fold=1, pair_split_seed=42)
+                    selected = [pairs[index] for index in dataset.indices]
+                    split_sources[split] = {pair["dataset_source"] for pair in selected}
+                    if strategy == "subject_10fold":
+                        split_groups[split] = {(pair["training_source"], pair["participant_id"])
+                                               for pair in selected}
+                    else:
+                        split_groups[split] = {_question_group_id(pair) for pair in selected}
+                        for pair in selected:
+                            if _question_group_id(pair) == _question_group_id(task[0]):
+                                shared_group_splits.setdefault(split, set()).add(pair["dataset_source"])
+
+                self.assertEqual(split_sources, {split: {"authentic_query_response", "alice", "nieuwland"}
+                                                 for split in ("train", "val", "test")})
+                self.assertFalse(split_groups["train"] & split_groups["val"])
+                self.assertFalse(split_groups["train"] & split_groups["test"])
+                self.assertFalse(split_groups["val"] & split_groups["test"])
+                if strategy == "query_10fold":
+                    self.assertEqual(len(shared_group_splits), 1)
+                    self.assertEqual(next(iter(shared_group_splits.values())),
+                                     {"authentic_query_response", "alice"})
 
     def test_best_checkpoint_copy_restores_the_best_epoch(self):
         def fake_epoch(model, **_):

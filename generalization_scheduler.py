@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from experiment_scheduler import AUDIO_BPR_DIR, _controller_command, _slurm_script, source_paths
-from stage_scheduler import AUDIO_DATA, EXPANDED_EVAL_INDEX, FM_PYTHON, MODALITIES, TASK_DATA, VISUAL_DATA
+from stage_scheduler import AUDIO_DATA, FM_PYTHON, MODALITIES, TASK_DATA, VISUAL_DATA
 
 FOLDS = range(1, 11)
 SEEDS = (42, 43, 44)
@@ -34,6 +34,7 @@ def build_plan(output_dir: Path) -> list[dict]:
             if modality not in BEST_MODELS:
                 continue
             fm_model, fm_tuning = BEST_MODELS[modality]
+            mixed_sources = (*source_names, "audio", "visual")
             encoders = (
                 ("transformer", ("--best-checkpoint-copy", "--eeg_arch", "transformer"), False),
                 (f"{fm_model}_{fm_tuning}",
@@ -48,15 +49,16 @@ def build_plan(output_dir: Path) -> list[dict]:
                             "name": name,
                             "modality": modality,
                             "encoder": encoder_name,
-                            "sources": list(source_names),
-                            "data_paths": [paths[source] for source in source_names],
+                            "sources": list(mixed_sources),
+                            "data_paths": [paths[source] for source in mixed_sources],
                             "split_strategy": split_strategy,
                             "cv_fold": fold,
-                            "expanded_eval_index": str(EXPANDED_EVAL_INDEX) if modality == "reading" else None,
+                            "expanded_eval_index": None,
                             "overrides": {
                                 **settings,
                                 "seed": seed,
                                 "split_seed": 42,
+                                "balance_sources": True,
                                 "extra_args": encoder_args,
                             },
                         }
@@ -67,7 +69,7 @@ def build_plan(output_dir: Path) -> list[dict]:
                             True, False, "mean", "Authentic Queries BPR",
                         )
                         command.extend(("--cv-fold", str(fold)))
-                        memory, time_limit = ("128G", "2-00:00:00") if is_fm else ("128G", "1-00:00:00")
+                        memory, time_limit = "256G", "2-00:00:00"
                         item.update({"output_dir": str(result_dir), "memory": memory, "time": time_limit})
                         plan.append(item)
     return plan
@@ -110,8 +112,11 @@ def prepare(output_dir: Path) -> Path:
         "split_policies": SPLITS,
         "baseline": "Audio BPR Transformer (eeg_arch=transformer), trained from scratch",
         "foundation_models": "EEGPT-full for reading and imagining; REVE-full for continuous typing",
-        "external_training_data": False,
-        "metrics": "Task-specific test-source MRR and hit rates at 90% masking; Gaussian-noise baseline",
+        "external_training_data": True,
+        "data_sources": ["task", "Alice", "Nieuwland all-labs (332 participants)"],
+        "source_balancing": "Equal-probability source sampling for training; all sources appear in each split.",
+        "candidate_index": "Test-fold documents from task, Alice and Nieuwland sources are ranked together.",
+        "metrics": "All-source and per-source test ranking at 0/25/50/75/90/100% masking; Gaussian-noise metrics at every level",
         "matrix": plan,
     }, indent=2) + "\n", encoding="utf-8")
     (output_dir / "PREPARED_NOT_SUBMITTED.txt").write_text(
