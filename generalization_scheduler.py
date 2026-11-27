@@ -11,7 +11,7 @@ from experiment_scheduler import AUDIO_BPR_DIR, _controller_command, _slurm_scri
 from stage_scheduler import AUDIO_DATA, FM_PYTHON, MODALITIES, TASK_DATA, VISUAL_DATA
 
 FOLDS = range(1, 11)
-SEEDS = (42, 43, 44)
+SEEDS = (42,)
 EXCLUDE_NODES = ("gpu04", "gpu05")
 BEST_MODELS = {
     "reading": ("eegpt", "full"),
@@ -37,13 +37,9 @@ def build_plan(output_dir: Path, selected_modalities=None) -> list[dict]:
         for modality, (source_names, settings) in MODALITIES.items():
             if modality not in selected_modalities:
                 continue
-            fm_model, fm_tuning = BEST_MODELS[modality]
             mixed_sources = (*source_names, "audio", "visual")
             encoders = (
                 ("transformer", ("--best-checkpoint-copy", "--eeg_arch", "transformer"), False),
-                (f"{fm_model}_{fm_tuning}",
-                 ("--best-checkpoint-copy", "--eeg_arch", fm_model, "--fm-finetune", fm_tuning, "--fm-amp"),
-                 True),
             )
             for encoder_name, encoder_args, is_fm in encoders:
                 for fold in FOLDS:
@@ -73,7 +69,7 @@ def build_plan(output_dir: Path, selected_modalities=None) -> list[dict]:
                             True, False, "mean", "Authentic Queries BPR",
                         )
                         command.extend(("--cv-fold", str(fold)))
-                        memory, time_limit = "256G", "2-00:00:00"
+                        memory, time_limit = "256G", "1-00:00:00"
                         item.update({"output_dir": str(result_dir), "memory": memory, "time": time_limit})
                         plan.append(item)
     return plan
@@ -107,7 +103,7 @@ def prepare(output_dir: Path, selected_modalities=None) -> Path:
         )
         script.chmod(0o755)
         item["job_script"] = str(script)
-    expected_count = len(SPLITS) * len(selected_modalities) * 2 * len(FOLDS) * len(SEEDS)
+    expected_count = len(SPLITS) * len(selected_modalities) * 1 * len(FOLDS) * len(SEEDS)
     assert len(by_name) == len(plan) == expected_count
     matrix_path.write_text(json.dumps({
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -117,7 +113,7 @@ def prepare(output_dir: Path, selected_modalities=None) -> Path:
         "best_foundation_models": BEST_MODELS,
         "split_policies": SPLITS,
         "baseline": "Audio BPR Transformer (eeg_arch=transformer), trained from scratch",
-        "foundation_models": "EEGPT-full for reading and imagining; REVE-full for continuous typing",
+        "foundation_models": "None in this baseline batch",
         "selected_modalities": selected_modalities,
         "external_training_data": True,
         "data_sources": ["task", "Alice", "Nieuwland all-labs (332 participants)"],
